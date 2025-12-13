@@ -1,0 +1,112 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
+  username     String   @unique
+  displayName  String
+  passwordHash String
+
+  // Stato e profilo
+  state        String   @default("OFFLINE")
+  statusText   String?
+  interests    String?
+  city         String?
+  area         String?
+
+ // NUOVO: stato emozionale
+  mood         String?     // 
+
+  // Nuovo campo: foto profilo
+  avatarUrl    String?
+
+  // Accettazione termini
+  termsAccepted Boolean @default(false)
+
+  // Ultimo accesso
+  lastSeen     DateTime?
+
+  // Relazioni chat
+  conversationParticipants ConversationParticipant[]
+  messages                 Message[]
+
+  // Amicizie
+  friendsA                 Friend[]        @relation("UserFriendsA")
+  friendsB                 Friend[]        @relation("UserFriendsB")
+
+  // Richieste amicizia
+  friendRequestsSent       FriendRequest[] @relation("FriendRequestSender")
+  friendRequestsReceived   FriendRequest[] @relation("FriendRequestReceiver")
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+
+model Friend {
+  id        Int   @id @default(autoincrement())
+  userAId   Int
+  userBId   Int
+
+  userA     User  @relation("UserFriendsA", fields: [userAId], references: [id])
+  userB     User  @relation("UserFriendsB", fields: [userBId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@unique([userAId, userBId])
+}
+
+model FriendRequest {
+  id         Int    @id @default(autoincrement())
+  senderId   Int
+  receiverId Int
+  status     String @default("PENDING") // PENDING | ACCEPTED | DECLINED
+
+  sender     User   @relation("FriendRequestSender", fields: [senderId], references: [id])
+  receiver   User   @relation("FriendRequestReceiver", fields: [receiverId], references: [id])
+
+  createdAt  DateTime @default(now())
+
+  @@unique([senderId, receiverId])
+}
+
+model Conversation {
+  id             Int                     @id @default(autoincrement())
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  participants   ConversationParticipant[]
+  messages       Message[]
+}
+
+model ConversationParticipant {
+  id             Int           @id @default(autoincrement())
+  userId         Int
+  conversationId Int
+  joinedAt       DateTime      @default(now())
+
+  user           User          @relation(fields: [userId], references: [id])
+  conversation   Conversation  @relation(fields: [conversationId], references: [id])
+
+  @@unique([userId, conversationId])
+}
+
+model Message {
+  id             Int           @id @default(autoincrement())
+  content        String
+  createdAt      DateTime      @default(now())
+  senderId       Int
+  conversationId Int
+
+  sender         User          @relation(fields: [senderId], references: [id])
+  conversation   Conversation  @relation(fields: [conversationId], references: [id])
+}
