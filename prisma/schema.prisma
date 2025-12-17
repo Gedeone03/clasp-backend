@@ -1,5 +1,3 @@
-// prisma/schema.prisma
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,103 +8,94 @@ datasource db {
 }
 
 model User {
-  id           Int      @id @default(autoincrement())
-  email        String   @unique
-  username     String   @unique
-  displayName  String
-  passwordHash String
+  id            Int      @id @default(autoincrement())
+  email         String   @unique
+  username      String   @unique
+  displayName   String
+  passwordHash  String
 
-  // Stato e profilo
-  state        String   @default("OFFLINE")
-  statusText   String?
-  interests    String?
-  city         String?
-  area         String?
+  state         String
+  statusText    String?
+  city          String?
+  area          String?
+  interests     String?
+  mood          String?
+  avatarUrl     String?
 
- // NUOVO: stato emozionale
-  mood         String?     // 
+  termsAccepted Boolean  @default(false)
+  lastSeen      DateTime @default(now())
 
-  // Nuovo campo: foto profilo
-  avatarUrl    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  // Accettazione termini
-  termsAccepted Boolean @default(false)
-
-  // Ultimo accesso
-  lastSeen     DateTime?
-
-  // Relazioni chat
-  conversationParticipants ConversationParticipant[]
+  // Relations
   messages                 Message[]
-
-  // Amicizie
-  friendsA                 Friend[]        @relation("UserFriendsA")
-  friendsB                 Friend[]        @relation("UserFriendsB")
-
-  // Richieste amicizia
-  friendRequestsSent       FriendRequest[] @relation("FriendRequestSender")
-  friendRequestsReceived   FriendRequest[] @relation("FriendRequestReceiver")
-
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  conversationParticipants ConversationParticipant[]
+  friendsA                 Friend[]        @relation("FriendA")
+  friendsB                 Friend[]        @relation("FriendB")
+  friendRequestsSent       FriendRequest[] @relation("FriendRequestSent")
+  friendRequestsReceived   FriendRequest[] @relation("FriendRequestReceived")
 }
 
+model Conversation {
+  id           Int      @id @default(autoincrement())
+  createdAt    DateTime @default(now())
+
+  participants ConversationParticipant[]
+  messages     Message[]
+}
+
+model ConversationParticipant {
+  id             Int      @id @default(autoincrement())
+  conversationId Int
+  userId         Int
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  user           User         @relation(fields: [userId], references: [id])
+
+  @@unique([conversationId, userId])
+}
+
+model Message {
+  id             Int      @id @default(autoincrement())
+  conversationId Int
+  senderId       Int
+
+  content        String
+  createdAt      DateTime @default(now())
+
+  editedAt       DateTime?
+  deletedAt      DateTime?
+
+  replyToId      Int?
+  replyTo        Message?   @relation("MessageReply", fields: [replyToId], references: [id])
+  replies        Message[]  @relation("MessageReply")
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  sender         User         @relation(fields: [senderId], references: [id])
+}
 
 model Friend {
-  id        Int   @id @default(autoincrement())
+  id        Int      @id @default(autoincrement())
   userAId   Int
   userBId   Int
-
-  userA     User  @relation("UserFriendsA", fields: [userAId], references: [id])
-  userB     User  @relation("UserFriendsB", fields: [userBId], references: [id])
-
   createdAt DateTime @default(now())
+
+  userA     User @relation("FriendA", fields: [userAId], references: [id])
+  userB     User @relation("FriendB", fields: [userBId], references: [id])
 
   @@unique([userAId, userBId])
 }
 
 model FriendRequest {
-  id         Int    @id @default(autoincrement())
+  id         Int      @id @default(autoincrement())
   senderId   Int
   receiverId Int
-  status     String @default("PENDING") // PENDING | ACCEPTED | DECLINED
-
-  sender     User   @relation("FriendRequestSender", fields: [senderId], references: [id])
-  receiver   User   @relation("FriendRequestReceiver", fields: [receiverId], references: [id])
-
+  status     String
   createdAt  DateTime @default(now())
 
+  sender     User @relation("FriendRequestSent", fields: [senderId], references: [id])
+  receiver   User @relation("FriendRequestReceived", fields: [receiverId], references: [id])
+
   @@unique([senderId, receiverId])
-}
-
-model Conversation {
-  id             Int                     @id @default(autoincrement())
-  createdAt      DateTime                @default(now())
-  updatedAt      DateTime                @updatedAt
-
-  participants   ConversationParticipant[]
-  messages       Message[]
-}
-
-model ConversationParticipant {
-  id             Int           @id @default(autoincrement())
-  userId         Int
-  conversationId Int
-  joinedAt       DateTime      @default(now())
-
-  user           User          @relation(fields: [userId], references: [id])
-  conversation   Conversation  @relation(fields: [conversationId], references: [id])
-
-  @@unique([userId, conversationId])
-}
-
-model Message {
-  id             Int           @id @default(autoincrement())
-  content        String
-  createdAt      DateTime      @default(now())
-  senderId       Int
-  conversationId Int
-
-  sender         User          @relation(fields: [senderId], references: [id])
-  conversation   Conversation  @relation(fields: [conversationId], references: [id])
 }
