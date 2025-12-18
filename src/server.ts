@@ -16,13 +16,16 @@ import { authMiddleware, AuthRequest } from "./middleware/auth";
 dotenv.config();
 
 const app = express();
+
+// ✅ importantissimo dietro proxy (Netlify/Railway) per usare https negli URL
+app.set("trust proxy", 1);
+
 const httpServer = http.createServer(app);
 
 const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "changeme";
 const SALT_ROUNDS = 10;
 
-// --- CORS
 const DEFAULT_ALLOWED_ORIGINS = ["https://claspme.com", "https://www.claspme.com"];
 const EXTRA_ORIGINS_FROM_ENV = (process.env.FRONTEND_URL || "")
   .split(",")
@@ -43,7 +46,6 @@ app.use(
 
 app.use(express.json());
 
-// --- Socket.IO
 const io = new Server(httpServer, {
   cors: {
     origin: ALLOWED_ORIGINS,
@@ -52,7 +54,6 @@ const io = new Server(httpServer, {
   },
 });
 
-// --- Rate limit login
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
@@ -61,7 +62,6 @@ const loginLimiter = rateLimit({
   message: { error: "Too many login attempts. Try again later." },
 });
 
-// --- Helpers
 const VALID_STATES = ["DISPONIBILE", "OCCUPATO", "ASSENTE", "OFFLINE", "INVISIBILE", "VISIBILE_A_TUTTI"];
 const VALID_INTERESTS = ["LAVORO", "AMICIZIA", "CHATTARE", "DATING", "INCONTRI"];
 
@@ -120,12 +120,11 @@ function toMessageDTO(msg: any) {
   };
 }
 
-// --- uploads folder + static
+// uploads
 const uploadsDir = path.join(__dirname, "..", "uploads");
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 app.use("/uploads", express.static(uploadsDir));
 
-// --- multer
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, uploadsDir),
   filename: (_req, file, cb) => {
@@ -137,10 +136,9 @@ const uploadImageMulter = multer({ storage });
 const uploadAvatarMulter = multer({ storage });
 const uploadAudioMulter = multer({ storage });
 
-// --- health
 app.get("/ping", (_req, res) => res.json({ message: "pong" }));
 
-// ----------------------- AUTH -----------------------
+// AUTH
 app.post("/auth/register", async (req, res) => {
   try {
     const { email, password, displayName, username, city, area, termsAccepted } = req.body;
@@ -187,9 +185,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
     const { emailOrUsername, password } = req.body;
     if (!emailOrUsername || !password) return res.status(400).json({ error: "emailOrUsername e password sono obbligatori" });
 
-    const user = await prisma.user.findFirst({
-      where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] },
-    });
+    const user = await prisma.user.findFirst({ where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] } });
     if (!user) return res.status(401).json({ error: "Credenziali non valide" });
 
     const ok = await bcrypt.compare(password, user.passwordHash);
@@ -203,7 +199,7 @@ app.post("/auth/login", loginLimiter, async (req, res) => {
   }
 });
 
-// ----------------------- ME -----------------------
+// ME
 app.get("/me", authMiddleware, async (req: AuthRequest, res) => {
   const me = await prisma.user.findUnique({ where: { id: req.user!.id } });
   if (!me) return res.status(404).json({ error: "Utente non trovato" });
@@ -223,7 +219,7 @@ app.put("/me", authMiddleware, async (req: AuthRequest, res) => {
     if (mood !== undefined) data.mood = mood;
 
     if (state !== undefined) {
-      if (!VALID_STATES.includes(state)) return res.status(400).json({ error: `state non valido` });
+      if (!VALID_STATES.includes(state)) return res.status(400).json({ error: "state non valido" });
       data.state = state;
     }
 
@@ -242,10 +238,11 @@ app.put("/me", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-// ----------------------- USERS SEARCH -----------------------
+// USERS SEARCH (robusta: q/term/query)
 app.get("/users", authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+    const qRaw = (req.query.q || req.query.term || req.query.query || "") as string;
+    const q = typeof qRaw === "string" ? qRaw.trim() : "";
     const visibleOnly = req.query.visibleOnly === "true";
     const mood = typeof req.query.mood === "string" ? req.query.mood.trim() : "";
 
@@ -262,16 +259,14 @@ app.get("/users", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-// ----------------------- FRIENDS -----------------------
+// FRIENDS
 app.post("/friends/request/:id", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const receiverId = Number(req.params.id);
     const senderId = req.user!.id;
     if (receiverId === senderId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
 
-    const existing = await prisma.friendRequest.findFirst({
-      where: { senderId, receiverId, status: "PENDING" },
-    });
+    const existing = await prisma.friendRequest.findFirst({ where: { senderId, receiverId, status: "PENDING" } });
     if (existing) return res.status(400).json({ error: "Richiesta già inviata" });
 
     await prisma.friendRequest.create({ data: { senderId, receiverId, status: "PENDING" } });
@@ -361,10 +356,11 @@ app.post("/friends/decline/:id", authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-// ----------------------- CONVERSATIONS -----------------------
+// CONVERSATIONS
 app.get("/conversations", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const userId = req.user!.id;
+
     const convs = await prisma.conversation.findMany({
       where: { participants: { some: { userId } } },
       include: {
@@ -403,7 +399,11 @@ app.post("/conversations", authMiddleware, async (req: AuthRequest, res) => {
       where: { participants: { some: { userId } }, AND: { participants: { some: { userId: otherUserId } } } },
       include: {
         participants: { include: { user: true } },
-        messages: { orderBy: { createdAt: "desc" }, take: 1, include: { sender: true, replyTo: { include: { sender: true } } } },
+        messages: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: { sender: true, replyTo: { include: { sender: true } } },
+        },
       },
     });
 
@@ -450,7 +450,7 @@ app.delete("/conversations/:id", authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-// ----------------------- MESSAGES (HTTP) -----------------------
+// MESSAGES
 app.get("/conversations/:id/messages", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const conversationId = Number(req.params.id);
@@ -524,32 +524,32 @@ app.delete("/messages/:id", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-// ----------------------- UPLOADS -----------------------
+// UPLOADS (✅ url sempre https dietro proxy)
+function makePublicUrl(req: any, filename: string) {
+  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol || "https";
+  return `${proto}://${req.get("host")}/uploads/${filename}`;
+}
+
 app.post("/upload/image", authMiddleware, uploadImageMulter.single("image"), (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-  res.json({ url });
+  res.json({ url: makePublicUrl(req, req.file.filename) });
 });
 
 app.post("/upload/avatar", authMiddleware, uploadAvatarMulter.single("avatar"), (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-  res.json({ url });
+  res.json({ url: makePublicUrl(req, req.file.filename) });
 });
 
 app.post("/upload/audio", authMiddleware, uploadAudioMulter.single("audio"), (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  const url = `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-  res.json({ url });
+  res.json({ url: makePublicUrl(req, req.file.filename) });
 });
 
-// ----------------------- SOCKET -----------------------
+// SOCKET
 io.on("connection", async (socket) => {
   try {
     const userId = Number((socket.handshake.auth as any)?.userId);
     if (!userId || Number.isNaN(userId)) return socket.disconnect();
-
-    (socket as any).userId = userId;
 
     await prisma.user.update({ where: { id: userId }, data: { state: "DISPONIBILE", lastSeen: new Date() } });
     io.emit("user:online", { userId });
@@ -589,7 +589,6 @@ io.on("connection", async (socket) => {
   }
 });
 
-// safe error handler
 app.use((err: any, _req: any, res: any, _next: any) => {
   console.error("Internal error:", err);
   res.status(500).json({ error: "Internal server error" });
