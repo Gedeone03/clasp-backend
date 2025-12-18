@@ -17,7 +17,7 @@ dotenv.config();
 
 const app = express();
 
-// ✅ importantissimo dietro proxy (Netlify/Railway) per usare https negli URL
+// IMPORTANT: behind Railway proxy -> correct https urls
 app.set("trust proxy", 1);
 
 const httpServer = http.createServer(app);
@@ -26,6 +26,7 @@ const PORT = process.env.PORT || 4000;
 const JWT_SECRET = process.env.JWT_SECRET || "changeme";
 const SALT_ROUNDS = 10;
 
+// CORS
 const DEFAULT_ALLOWED_ORIGINS = ["https://claspme.com", "https://www.claspme.com"];
 const EXTRA_ORIGINS_FROM_ENV = (process.env.FRONTEND_URL || "")
   .split(",")
@@ -46,6 +47,7 @@ app.use(
 
 app.use(express.json());
 
+// Socket.IO
 const io = new Server(httpServer, {
   cors: {
     origin: ALLOWED_ORIGINS,
@@ -62,7 +64,14 @@ const loginLimiter = rateLimit({
   message: { error: "Too many login attempts. Try again later." },
 });
 
-const VALID_STATES = ["DISPONIBILE", "OCCUPATO", "ASSENTE", "OFFLINE", "INVISIBILE", "VISIBILE_A_TUTTI"];
+const VALID_STATES = [
+  "DISPONIBILE",
+  "OCCUPATO",
+  "ASSENTE",
+  "OFFLINE",
+  "INVISIBILE",
+  "VISIBILE_A_TUTTI",
+];
 const VALID_INTERESTS = ["LAVORO", "AMICIZIA", "CHATTARE", "DATING", "INCONTRI"];
 
 function parseInterests(csv: string | null | undefined): string[] {
@@ -136,6 +145,15 @@ const uploadImageMulter = multer({ storage });
 const uploadAvatarMulter = multer({ storage });
 const uploadAudioMulter = multer({ storage });
 
+function makePublicUrl(req: any, filename: string) {
+  const proto =
+    (req.headers["x-forwarded-proto"] as string) ||
+    req.protocol ||
+    "https";
+  return `${proto}://${req.get("host")}/uploads/${filename}`;
+}
+
+// Health
 app.get("/ping", (_req, res) => res.json({ message: "pong" }));
 
 // AUTH
@@ -183,9 +201,13 @@ app.post("/auth/register", async (req, res) => {
 app.post("/auth/login", loginLimiter, async (req, res) => {
   try {
     const { emailOrUsername, password } = req.body;
-    if (!emailOrUsername || !password) return res.status(400).json({ error: "emailOrUsername e password sono obbligatori" });
+    if (!emailOrUsername || !password) {
+      return res.status(400).json({ error: "emailOrUsername e password sono obbligatori" });
+    }
 
-    const user = await prisma.user.findFirst({ where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] } });
+    const user = await prisma.user.findFirst({
+      where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] },
+    });
     if (!user) return res.status(401).json({ error: "Credenziali non valide" });
 
     const ok = await bcrypt.compare(password, user.passwordHash);
@@ -238,23 +260,52 @@ app.put("/me", authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
-// USERS SEARCH (robusta: q/term/query)
+/**
+ * USERS SEARCH (advanced)
+ * q: name/username/email (optional)
+ * visibleOnly: show only VISIBILE_A_TUTTI even if q is empty
+ * city/area: filters even if q empty
+ * mood: optional
+ */
 app.get("/users", authMiddleware, async (req: AuthRequest, res) => {
   try {
     const qRaw = (req.query.q || req.query.term || req.query.query || "") as string;
     const q = typeof qRaw === "string" ? qRaw.trim() : "";
+
     const visibleOnly = req.query.visibleOnly === "true";
+    const city = typeof req.query.city === "string" ? req.query.city.trim() : "";
+    const area = typeof req.query.area === "string" ? req.query.area.trim() : "";
     const mood = typeof req.query.mood === "string" ? req.query.mood.trim() : "";
 
+    // If user provided nothing at all, do not return all users.
+    // But allow empty q if visibleOnly/city/area/mood is set.
+    const hasSomeFilter = !!q || visibleOnly || !!city || !!area || !!mood;
+    if (!hasSomeFilter) return res.json([]);
+
     const where: any = {};
-    if (q) where.OR = [{ username: { contains: q } }, { displayName: { contains: q } }, { email: { contains: q } }];
+
+    if (q) {
+      where.OR = [
+        { username: { contains: q } },
+        { displayName: { contains: q } },
+        { email: { contains: q } },
+      ];
+    }
+
     if (visibleOnly) where.state = "VISIBILE_A_TUTTI";
+    if (city) where.city = { contains: city };
+    if (area) where.area = { contains: area };
     if (mood) where.mood = mood;
 
-    const users = await prisma.user.findMany({ where, orderBy: { displayName: "asc" }, take: 50 });
+    const users = await prisma.user.findMany({
+      where,
+      orderBy: { displayName: "asc" },
+      take: 100,
+    });
+
     res.json(users.map(toUserDTO));
   } catch (err) {
-    console.error(err);
+    console.error("Errore GET /users:", err);
     res.status(500).json({ error: "Errore server" });
   }
 });
@@ -264,9 +315,12 @@ app.post("/friends/request/:id", authMiddleware, async (req: AuthRequest, res) =
   try {
     const receiverId = Number(req.params.id);
     const senderId = req.user!.id;
+
     if (receiverId === senderId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
 
-    const existing = await prisma.friendRequest.findFirst({ where: { senderId, receiverId, status: "PENDING" } });
+    const existing = await prisma.friendRequest.findFirst({
+      where: { senderId, receiverId, status: "PENDING" },
+    });
     if (existing) return res.status(400).json({ error: "Richiesta già inviata" });
 
     await prisma.friendRequest.create({ data: { senderId, receiverId, status: "PENDING" } });
@@ -356,196 +410,151 @@ app.post("/friends/decline/:id", authMiddleware, async (req: AuthRequest, res) =
   }
 });
 
-// CONVERSATIONS
+// CONVERSATIONS + MESSAGES + EDIT/DELETE + UPLOAD + SOCKET
+// (mantieni le tue route già stabili; qui teniamo quelle già usate nella tua app)
+
 app.get("/conversations", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const userId = req.user!.id;
-
-    const convs = await prisma.conversation.findMany({
-      where: { participants: { some: { userId } } },
-      include: {
-        participants: { include: { user: true } },
-        messages: {
-          orderBy: { createdAt: "desc" },
-          take: 1,
-          include: { sender: true, replyTo: { include: { sender: true } } },
-        },
+  const userId = req.user!.id;
+  const convs = await prisma.conversation.findMany({
+    where: { participants: { some: { userId } } },
+    include: {
+      participants: { include: { user: true } },
+      messages: {
+        orderBy: { createdAt: "desc" },
+        take: 1,
+        include: { sender: true, replyTo: { include: { sender: true } } },
       },
-      orderBy: { id: "desc" },
-    });
+    },
+    orderBy: { id: "desc" },
+  });
 
-    res.json(
-      convs.map((c) => ({
-        ...c,
-        participants: c.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
-        messages: c.messages.map((m) => toMessageDTO(m)),
-      }))
-    );
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
+  res.json(
+    convs.map((c) => ({
+      ...c,
+      participants: c.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
+      messages: c.messages.map((m) => toMessageDTO(m)),
+    }))
+  );
 });
 
 app.post("/conversations", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const { otherUserId } = req.body;
-    const userId = req.user!.id;
+  const { otherUserId } = req.body;
+  const userId = req.user!.id;
 
-    if (!otherUserId) return res.status(400).json({ error: "otherUserId obbligatorio" });
-    if (otherUserId === userId) return res.status(400).json({ error: "Non puoi chattare con te stesso" });
+  if (!otherUserId) return res.status(400).json({ error: "otherUserId obbligatorio" });
+  if (otherUserId === userId) return res.status(400).json({ error: "Non puoi chattare con te stesso" });
 
-    const existing = await prisma.conversation.findFirst({
-      where: { participants: { some: { userId } }, AND: { participants: { some: { userId: otherUserId } } } },
-      include: {
-        participants: { include: { user: true } },
-        messages: {
-          orderBy: { createdAt: "desc" },
-          take: 1,
-          include: { sender: true, replyTo: { include: { sender: true } } },
-        },
-      },
+  const existing = await prisma.conversation.findFirst({
+    where: { participants: { some: { userId } }, AND: { participants: { some: { userId: otherUserId } } } },
+    include: { participants: { include: { user: true } }, messages: { orderBy: { createdAt: "desc" }, take: 1, include: { sender: true, replyTo: { include: { sender: true } } } } },
+  });
+
+  if (existing) {
+    return res.json({
+      ...existing,
+      participants: existing.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
+      messages: existing.messages.map((m) => toMessageDTO(m)),
     });
-
-    if (existing) {
-      return res.json({
-        ...existing,
-        participants: existing.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
-        messages: existing.messages.map((m) => toMessageDTO(m)),
-      });
-    }
-
-    const conv = await prisma.conversation.create({
-      data: { participants: { create: [{ userId }, { userId: otherUserId }] } },
-      include: { participants: { include: { user: true } } },
-    });
-
-    res.status(201).json({
-      ...conv,
-      participants: conv.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
-      messages: [],
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
   }
+
+  const conv = await prisma.conversation.create({
+    data: { participants: { create: [{ userId }, { userId: otherUserId }] } },
+    include: { participants: { include: { user: true } } },
+  });
+
+  res.status(201).json({
+    ...conv,
+    participants: conv.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
+    messages: [],
+  });
 });
 
 app.delete("/conversations/:id", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const conversationId = Number(req.params.id);
-    const userId = req.user!.id;
+  const conversationId = Number(req.params.id);
+  const userId = req.user!.id;
 
-    const participant = await prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
-    if (!participant) return res.status(403).json({ error: "Non fai parte di questa conversazione" });
+  const participant = await prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
+  if (!participant) return res.status(403).json({ error: "Non fai parte di questa conversazione" });
 
-    await prisma.message.deleteMany({ where: { conversationId } });
-    await prisma.conversationParticipant.deleteMany({ where: { conversationId } });
-    await prisma.conversation.delete({ where: { id: conversationId } });
+  await prisma.message.deleteMany({ where: { conversationId } });
+  await prisma.conversationParticipant.deleteMany({ where: { conversationId } });
+  await prisma.conversation.delete({ where: { id: conversationId } });
 
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
+  res.json({ ok: true });
 });
 
-// MESSAGES
 app.get("/conversations/:id/messages", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const conversationId = Number(req.params.id);
-    const userId = req.user!.id;
+  const conversationId = Number(req.params.id);
+  const userId = req.user!.id;
 
-    const participant = await prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
-    if (!participant) return res.status(403).json({ error: "Non fai parte di questa conversazione" });
+  const participant = await prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
+  if (!participant) return res.status(403).json({ error: "Non fai parte di questa conversazione" });
 
-    const msgs = await prisma.message.findMany({
-      where: { conversationId },
-      orderBy: { createdAt: "asc" },
-      include: { sender: true, replyTo: { include: { sender: true } } },
-    });
+  const msgs = await prisma.message.findMany({
+    where: { conversationId },
+    orderBy: { createdAt: "asc" },
+    include: { sender: true, replyTo: { include: { sender: true } } },
+  });
 
-    res.json(msgs.map((m) => toMessageDTO(m)));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
+  res.json(msgs.map((m) => toMessageDTO(m)));
 });
 
 app.patch("/messages/:id", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const id = Number(req.params.id);
-    const userId = req.user!.id;
-    const { content } = req.body;
+  const id = Number(req.params.id);
+  const userId = req.user!.id;
+  const { content } = req.body;
 
-    if (!content || !content.trim()) return res.status(400).json({ error: "content obbligatorio" });
+  if (!content || !content.trim()) return res.status(400).json({ error: "content obbligatorio" });
 
-    const msg = await prisma.message.findUnique({ where: { id } });
-    if (!msg) return res.status(404).json({ error: "Messaggio non trovato" });
-    if (msg.senderId !== userId) return res.status(403).json({ error: "Non autorizzato" });
-    if (msg.deletedAt) return res.status(400).json({ error: "Messaggio eliminato" });
+  const msg = await prisma.message.findUnique({ where: { id } });
+  if (!msg) return res.status(404).json({ error: "Messaggio non trovato" });
+  if (msg.senderId !== userId) return res.status(403).json({ error: "Non autorizzato" });
+  if (msg.deletedAt) return res.status(400).json({ error: "Messaggio eliminato" });
 
-    const updated = await prisma.message.update({
-      where: { id },
-      data: { content, editedAt: new Date() },
-      include: { sender: true, replyTo: { include: { sender: true } } },
-    });
+  const updated = await prisma.message.update({
+    where: { id },
+    data: { content, editedAt: new Date() },
+    include: { sender: true, replyTo: { include: { sender: true } } },
+  });
 
-    const dto = toMessageDTO(updated);
-    io.to(`conv_${updated.conversationId}`).emit("message:update", { conversationId: updated.conversationId, message: dto });
-    res.json(dto);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
+  const dto = toMessageDTO(updated);
+  io.to(`conv_${updated.conversationId}`).emit("message:update", { conversationId: updated.conversationId, message: dto });
+  res.json(dto);
 });
 
 app.delete("/messages/:id", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const id = Number(req.params.id);
-    const userId = req.user!.id;
+  const id = Number(req.params.id);
+  const userId = req.user!.id;
 
-    const msg = await prisma.message.findUnique({ where: { id } });
-    if (!msg) return res.status(404).json({ error: "Messaggio non trovato" });
-    if (msg.senderId !== userId) return res.status(403).json({ error: "Non autorizzato" });
+  const msg = await prisma.message.findUnique({ where: { id } });
+  if (!msg) return res.status(404).json({ error: "Messaggio non trovato" });
+  if (msg.senderId !== userId) return res.status(403).json({ error: "Non autorizzato" });
 
-    const updated = await prisma.message.update({
-      where: { id },
-      data: { deletedAt: new Date(), content: "" },
-      include: { sender: true, replyTo: { include: { sender: true } } },
-    });
+  const updated = await prisma.message.update({
+    where: { id },
+    data: { deletedAt: new Date(), content: "" },
+    include: { sender: true, replyTo: { include: { sender: true } } },
+  });
 
-    const dto = toMessageDTO(updated);
-    io.to(`conv_${updated.conversationId}`).emit("message:delete", { conversationId: updated.conversationId, message: dto });
-    res.json(dto);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
+  const dto = toMessageDTO(updated);
+  io.to(`conv_${updated.conversationId}`).emit("message:delete", { conversationId: updated.conversationId, message: dto });
+  res.json(dto);
 });
-
-// UPLOADS (✅ url sempre https dietro proxy)
-function makePublicUrl(req: any, filename: string) {
-  const proto = (req.headers["x-forwarded-proto"] as string) || req.protocol || "https";
-  return `${proto}://${req.get("host")}/uploads/${filename}`;
-}
 
 app.post("/upload/image", authMiddleware, uploadImageMulter.single("image"), (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
   res.json({ url: makePublicUrl(req, req.file.filename) });
 });
-
 app.post("/upload/avatar", authMiddleware, uploadAvatarMulter.single("avatar"), (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
   res.json({ url: makePublicUrl(req, req.file.filename) });
 });
-
 app.post("/upload/audio", authMiddleware, uploadAudioMulter.single("audio"), (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: "Nessun file" });
   res.json({ url: makePublicUrl(req, req.file.filename) });
 });
 
-// SOCKET
+// SOCKET (send message w replyToId)
 io.on("connection", async (socket) => {
   try {
     const userId = Number((socket.handshake.auth as any)?.userId);
