@@ -4,12 +4,19 @@ import http from "http";
 import cors from "cors";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import path from "path";
+import fs from "fs";
 import { PrismaClient } from "@prisma/client";
-import { Server } from "socket.io";
+import { Server as SocketIOServer } from "socket.io";
+
+// Multer: uso require per evitare problemi di typings in build
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const multer = require("multer") as any;
 
 const prisma = new PrismaClient();
+
 const app = express();
-const server = http.createServer(app);
+const httpServer = http.createServer(app);
 
 app.set("trust proxy", 1);
 
@@ -42,17 +49,37 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "3mb" }));
+app.use(express.json({ limit: "10mb" }));
 
-// ✅ Socket.IO (così sparisce anche websocket 404)
-const io = new Server(server, {
-  cors: {
-    origin: Array.from(allowedOrigins),
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    credentials: true,
+/** ===== Uploads (avatar + immagini chat) ===== */
+const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
+const AVATAR_DIR = path.join(UPLOADS_DIR, "avatars");
+const CHAT_IMG_DIR = path.join(UPLOADS_DIR, "chat-images");
+
+for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR]) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+app.use("/uploads", express.static(UPLOADS_DIR));
+
+const storage = multer.diskStorage({
+  destination: (req: any, file: any, cb: any) => {
+    if (file?.fieldname === "avatar") return cb(null, AVATAR_DIR);
+    return cb(null, CHAT_IMG_DIR);
+  },
+  filename: (req: any, file: any, cb: any) => {
+    const ext = path.extname(file.originalname || "").slice(0, 12) || "";
+    const safe = `${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`;
+    cb(null, safe);
   },
 });
 
+const upload = multer({
+  storage,
+  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+});
+
+/** ===== Auth middleware ===== */
 type AuthedRequest = Request & { userId?: number };
 
 function getBearer(req: Request): string | null {
@@ -86,17 +113,125 @@ function signToken(userId: number) {
   return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
 }
 
-// health
+/** ===== Socket.IO ===== */
+const io = new SocketIOServer(httpServer, {
+  cors: {
+    origin: Array.from(allowedOrigins),
+    credentials: true,
+  },
+});
+
+io.use((socket, next) => {
+  // Il client di solito manda token in auth: { token }
+  const token =
+    (socket.handshake as any)?.auth?.token ||
+    (socket.handshake as any)?.query?.token ||
+    null;
+
+  if (!token) {
+    (socket.data as any).userId = null;
+    return next();
+  }
+
+  try {
+    const decoded = jwt.verify(String(token), JWT_SECRET) as any;
+    (socket.data as any).userId = Number(decoded?.userId) || null;
+  } catch {
+    (socket.data as any).userId = null;
+  }
+  next();
+});
+
+async function ensureParticipant(conversationId: number, userId: number) {
+  const part = await prisma.conversationParticipant.findFirst({
+    where: { conversationId, userId },
+  } as any);
+  return !!part;
+}
+
+io.on("connection", (socket) => {
+  socket.on("conversation:join", async ({ conversationId }: any) => {
+    const cid = Number(conversationId);
+    const uid = Number((socket.data as any).userId);
+    if (!cid || !uid) return;
+
+    const ok = await ensureParticipant(cid, uid);
+    if (!ok) return;
+
+    socket.join(`conv_${cid}`);
+  });
+
+  socket.on("typing", async ({ conversationId }: any) => {
+    const cid = Number(conversationId);
+    const uid = Number((socket.data as any).userId);
+    if (!cid || !uid) return;
+
+    const ok = await ensureParticipant(cid, uid);
+    if (!ok) return;
+
+    socket.to(`conv_${cid}`).emit("typing", { conversationId: cid, userId: uid });
+  });
+
+  socket.on("message:send", async ({ conversationId, content, replyToId }: any) => {
+    try {
+      const cid = Number(conversationId);
+      const uid = Number((socket.data as any).userId);
+      const text = String(content || "").trim();
+      const rtid = replyToId == null ? null : Number(replyToId);
+
+      if (!cid || !uid || !text) return;
+
+      const ok = await ensureParticipant(cid, uid);
+      if (!ok) return;
+
+      // ✅ include sender così NON esiste più l’errore TS message.sender
+      const msg = await prisma.message.create({
+        data: {
+          conversationId: cid,
+          senderId: uid,
+          content: text,
+          replyToId: Number.isFinite(rtid as any) ? (rtid as any) : null,
+        } as any,
+        include: { sender: true } as any,
+      } as any);
+
+      const payload = { ...msg, sender: safeUser((msg as any).sender) };
+
+      io.to(`conv_${cid}`).emit("message:new", { conversationId: cid, message: payload });
+      io.to(`conv_${cid}`).emit("message", { conversationId: cid, message: payload }); // alias di compatibilità
+    } catch (e) {
+      console.error("SOCKET_MESSAGE_SEND_ERR", e);
+    }
+  });
+});
+
+/** ===== Routes ===== */
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // AUTH
 app.post("/auth/register", async (req, res) => {
   try {
-    const { email, password, username, displayName, city = null, area = null, termsAccepted } = req.body || {};
-    if (!email || !password || !username || !displayName) return res.status(400).json({ error: "Campi mancanti" });
-    if (termsAccepted !== true) return res.status(400).json({ error: "Devi accettare i Termini e le Condizioni" });
+    const {
+      email,
+      password,
+      username,
+      displayName,
+      city = null,
+      area = null,
+      termsAccepted,
+    } = req.body || {};
 
-    const exists = await prisma.user.findFirst({ where: { OR: [{ email }, { username }] } });
+    if (!email || !password || !username || !displayName) {
+      return res.status(400).json({ error: "Campi mancanti" });
+    }
+
+    if (termsAccepted !== true) {
+      return res.status(400).json({ error: "Devi accettare i Termini e le Condizioni" });
+    }
+
+    const exists = await prisma.user.findFirst({
+      where: { OR: [{ email }, { username }] },
+    } as any);
     if (exists) return res.status(409).json({ error: "Email o username già in uso" });
 
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
@@ -115,13 +250,13 @@ app.post("/auth/register", async (req, res) => {
         lastSeen: new Date(),
         termsAccepted: true,
       } as any,
-    });
+    } as any);
 
     const token = signToken(user.id);
-    res.json({ token, user: safeUser(user) });
+    return res.json({ token, user: safeUser(user) });
   } catch (e) {
     console.error("REGISTER_ERR", e);
-    res.status(500).json({ error: "Errore registrazione" });
+    return res.status(500).json({ error: "Errore registrazione" });
   }
 });
 
@@ -130,155 +265,551 @@ app.post("/auth/login", async (req, res) => {
     const { emailOrUsername, password } = req.body || {};
     if (!emailOrUsername || !password) return res.status(400).json({ error: "Campi mancanti" });
 
-    const user = await prisma.user.findFirst({ where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] } });
+    const user = await prisma.user.findFirst({
+      where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] },
+    } as any);
+
     if (!user) return res.status(401).json({ error: "Credenziali non valide" });
 
     const ok = await bcrypt.compare(password, (user as any).passwordHash);
     if (!ok) return res.status(401).json({ error: "Credenziali non valide" });
 
-    try { await prisma.user.update({ where: { id: user.id }, data: { lastSeen: new Date() } as any }); } catch {}
+    try {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { lastSeen: new Date() } as any,
+      } as any);
+    } catch {}
 
     const token = signToken(user.id);
-    res.json({ token, user: safeUser(user) });
+    return res.json({ token, user: safeUser(user) });
   } catch (e) {
     console.error("LOGIN_ERR", e);
-    res.status(500).json({ error: "Errore login" });
+    return res.status(500).json({ error: "Errore login" });
   }
 });
 
 app.get("/me", requireAuth, async (req: AuthedRequest, res) => {
-  const me = await prisma.user.findUnique({ where: { id: req.userId! } });
-  if (!me) return res.status(404).json({ error: "Utente non trovato" });
-  res.json(safeUser(me));
+  try {
+    const me = await prisma.user.findUnique({ where: { id: req.userId! } } as any);
+    if (!me) return res.status(404).json({ error: "Utente non trovato" });
+    return res.json(safeUser(me));
+  } catch (e) {
+    console.error("ME_ERR", e);
+    return res.status(500).json({ error: "Errore /me" });
+  }
 });
 
-// FRIENDS
+// Profilo update (impostazioni)
+app.patch("/me", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const data: any = {};
+    const body = req.body || {};
+
+    const allowed = ["displayName", "statusText", "state", "city", "area", "interests", "mood"];
+    for (const k of allowed) {
+      if (k in body) data[k] = body[k];
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: req.userId! },
+      data,
+    } as any);
+
+    return res.json(safeUser(updated));
+  } catch (e) {
+    console.error("ME_PATCH_ERR", e);
+    return res.status(500).json({ error: "Errore aggiornamento profilo" });
+  }
+});
+
+// Upload avatar
+app.post("/upload/avatar", requireAuth, upload.single("avatar"), async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+
+    const avatarUrl = `/uploads/avatars/${req.file.filename}`;
+
+    const updated = await prisma.user.update({
+      where: { id: req.userId },
+      data: { avatarUrl } as any,
+    } as any);
+
+    return res.json({ ok: true, avatarUrl, user: safeUser(updated) });
+  } catch (e) {
+    console.error("UPLOAD_AVATAR_ERR", e);
+    return res.status(500).json({ error: "Errore upload avatar" });
+  }
+});
+
+// Upload immagine chat
+app.post("/upload/image", requireAuth, upload.single("image"), async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+    const url = `/uploads/chat-images/${req.file.filename}`;
+    return res.json({ ok: true, url });
+  } catch (e) {
+    console.error("UPLOAD_IMAGE_ERR", e);
+    return res.status(500).json({ error: "Errore upload immagine" });
+  }
+});
+
+// Ricerca utenti (colonna ricerca)
+app.get("/users/search", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const city = String(req.query.city || "").trim();
+    const area = String(req.query.area || "").trim();
+    const mood = String(req.query.mood || "").trim();
+    const state = String(req.query.state || "").trim();
+    const visibleOnly = String(req.query.visibleOnly || "").trim() === "true";
+
+    const where: any = { NOT: { id: req.userId! } };
+
+    if (q) {
+      where.OR = [
+        { username: { contains: q, mode: "insensitive" } },
+        { displayName: { contains: q, mode: "insensitive" } },
+      ];
+    }
+    if (city) where.city = { contains: city, mode: "insensitive" };
+    if (area) where.area = { contains: area, mode: "insensitive" };
+    if (mood) where.mood = mood;
+    if (state) where.state = state;
+    if (visibleOnly) where.state = "VISIBILE_A_TUTTI";
+
+    const users = await prisma.user.findMany({
+      where,
+      orderBy: { id: "desc" },
+      take: 80,
+    } as any);
+
+    return res.json(users.map(safeUser));
+  } catch (e) {
+    console.error("USER_SEARCH_ERR", e);
+    return res.status(500).json({ error: "Errore ricerca utenti" });
+  }
+});
+
+/** FRIENDS */
 app.get("/friends", requireAuth, async (req: AuthedRequest, res) => {
-  const myId = req.userId!;
-  const rows = await prisma.friend.findMany({
-    where: { OR: [{ userAId: myId }, { userBId: myId }] },
-    include: { userA: true, userB: true },
-  } as any);
+  try {
+    const myId = req.userId!;
+    const rows = await prisma.friend.findMany({
+      where: { OR: [{ userAId: myId }, { userBId: myId }] },
+      include: { userA: true, userB: true },
+    } as any);
 
-  const friends = rows.map((f: any) => (f.userAId === myId ? f.userB : f.userA)).filter(Boolean).map(safeUser);
-  res.json(friends);
+    const friends = rows
+      .map((f: any) => (f.userAId === myId ? f.userB : f.userA))
+      .filter(Boolean)
+      .map(safeUser);
+
+    return res.json(friends);
+  } catch (e) {
+    console.error("FRIENDS_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento amici" });
+  }
 });
 
+// richieste ricevute
 app.get("/friends/requests/received", requireAuth, async (req: AuthedRequest, res) => {
-  const myId = req.userId!;
-  const requests = await prisma.friendRequest.findMany({
-    where: { receiverId: myId },
-    orderBy: { createdAt: "desc" },
-    include: { sender: true },
-  } as any);
+  try {
+    const myId = req.userId!;
+    const requests = await prisma.friendRequest.findMany({
+      where: { receiverId: myId },
+      orderBy: { createdAt: "desc" },
+      include: { sender: true },
+    } as any);
 
-  res.json(
-    requests.map((r: any) => ({
-      id: r.id,
-      createdAt: r.createdAt,
-      senderId: r.senderId,
-      receiverId: r.receiverId,
-      sender: safeUser(r.sender),
-    }))
-  );
+    return res.json(
+      requests.map((r: any) => ({
+        id: r.id,
+        createdAt: r.createdAt,
+        senderId: r.senderId,
+        receiverId: r.receiverId,
+        sender: safeUser(r.sender),
+      }))
+    );
+  } catch (e) {
+    console.error("REQ_RECEIVED_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento richieste" });
+  }
 });
 
+// richieste inviate
 app.get("/friends/requests/sent", requireAuth, async (req: AuthedRequest, res) => {
-  const myId = req.userId!;
-  const requests = await prisma.friendRequest.findMany({
-    where: { senderId: myId },
-    orderBy: { createdAt: "desc" },
-    include: { receiver: true },
-  } as any);
+  try {
+    const myId = req.userId!;
+    const requests = await prisma.friendRequest.findMany({
+      where: { senderId: myId },
+      orderBy: { createdAt: "desc" },
+      include: { receiver: true },
+    } as any);
 
-  res.json(
-    requests.map((r: any) => ({
-      id: r.id,
-      createdAt: r.createdAt,
-      senderId: r.senderId,
-      receiverId: r.receiverId,
-      receiver: safeUser(r.receiver),
-    }))
+    return res.json(
+      requests.map((r: any) => ({
+        id: r.id,
+        createdAt: r.createdAt,
+        senderId: r.senderId,
+        receiverId: r.receiverId,
+        receiver: safeUser(r.receiver),
+      }))
+    );
+  } catch (e) {
+    console.error("REQ_SENT_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento richieste inviate" });
+  }
+});
+
+// alias compat (alcune versioni del frontend chiamano /friends/requests)
+app.get("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
+  // per compat: rimando le ricevute
+  return app._router.handle(
+    { ...req, url: "/friends/requests/received", path: "/friends/requests/received" } as any,
+    res,
+    (() => {}) as any
   );
 });
 
-// CONVERSATIONS
-app.get("/conversations", requireAuth, async (req: AuthedRequest, res) => {
-  const myId = req.userId!;
-  const convs = await prisma.conversation.findMany({
-    where: { participants: { some: { userId: myId } } },
-    include: {
-      participants: { include: { user: true } },
-      messages: { orderBy: { createdAt: "desc" }, take: 1, include: { sender: true } }, // ✅ include sender
-    },
-    orderBy: { id: "desc" },
-  } as any);
+// invio richiesta amicizia
+app.post("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const otherId = Number(req.body?.userId);
 
-  res.json(
-    convs.map((c: any) => ({
-      ...c,
-      participants: c.participants.map((p: any) => ({ ...p, user: safeUser(p.user) })),
-      messages: (c.messages || []).map((m: any) => ({
-        ...m,
-        sender: safeUser((m as any).sender), // ✅ cast per TS
-      })),
-    }))
-  );
+    if (!otherId || Number.isNaN(otherId)) return res.status(400).json({ error: "userId non valido" });
+    if (otherId === myId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
+
+    const alreadyFriend = await prisma.friend.findFirst({
+      where: {
+        OR: [
+          { userAId: myId, userBId: otherId },
+          { userAId: otherId, userBId: myId },
+        ],
+      },
+    } as any);
+    if (alreadyFriend) return res.status(409).json({ error: "Siete già amici" });
+
+    const existingReq = await prisma.friendRequest.findFirst({
+      where: {
+        OR: [
+          { senderId: myId, receiverId: otherId },
+          { senderId: otherId, receiverId: myId },
+        ],
+      },
+    } as any);
+    if (existingReq) return res.status(409).json({ error: "Richiesta già presente" });
+
+    const fr = await prisma.friendRequest.create({
+      data: { senderId: myId, receiverId: otherId } as any,
+    } as any);
+
+    return res.json({ ok: true, request: fr });
+  } catch (e) {
+    console.error("REQ_CREATE_ERR", e);
+    return res.status(500).json({ error: "Errore invio richiesta" });
+  }
+});
+
+app.post("/friends/requests/:id/accept", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id)) return res.status(400).json({ error: "id non valido" });
+
+    const fr = await prisma.friendRequest.findUnique({ where: { id } } as any);
+    if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
+    if ((fr as any).receiverId !== myId) return res.status(403).json({ error: "Non autorizzato" });
+
+    const senderId = Number((fr as any).senderId);
+    const a = Math.min(senderId, myId);
+    const b = Math.max(senderId, myId);
+
+    const already = await prisma.friend.findFirst({
+      where: { OR: [{ userAId: a, userBId: b }, { userAId: b, userBId: a }] },
+    } as any);
+
+    if (!already) {
+      await prisma.friend.create({ data: { userAId: a, userBId: b } as any } as any);
+    }
+
+    await prisma.friendRequest.delete({ where: { id } } as any);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("REQ_ACCEPT_ERR", e);
+    return res.status(500).json({ error: "Errore accettazione richiesta" });
+  }
+});
+
+app.post("/friends/requests/:id/decline", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id)) return res.status(400).json({ error: "id non valido" });
+
+    const fr = await prisma.friendRequest.findUnique({ where: { id } } as any);
+    if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
+    if ((fr as any).receiverId !== myId) return res.status(403).json({ error: "Non autorizzato" });
+
+    await prisma.friendRequest.delete({ where: { id } } as any);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("REQ_DECLINE_ERR", e);
+    return res.status(500).json({ error: "Errore rifiuto richiesta" });
+  }
+});
+
+/** CONVERSATIONS */
+app.get("/conversations", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+
+    const convs = await prisma.conversation.findMany({
+      where: { participants: { some: { userId: myId } } },
+      include: {
+        participants: { include: { user: true } },
+        messages: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: { sender: true } as any,
+        },
+      },
+      orderBy: { id: "desc" },
+    } as any);
+
+    return res.json(
+      convs.map((c: any) => {
+        const participants = (c.participants || []).map((p: any) => ({ ...p, user: safeUser(p.user) }));
+        const last = (c.messages && c.messages[0]) ? { ...c.messages[0], sender: safeUser(c.messages[0].sender) } : null;
+        return {
+          ...c,
+          participants,
+          lastMessage: last,
+        };
+      })
+    );
+  } catch (e) {
+    console.error("CONV_LIST_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento conversazioni" });
+  }
+});
+
+// crea o recupera chat 1-1
+app.post("/conversations", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const otherUserId = Number(req.body?.otherUserId);
+
+    if (!otherUserId || Number.isNaN(otherUserId)) return res.status(400).json({ error: "otherUserId non valido" });
+    if (otherUserId === myId) return res.status(400).json({ error: "Non valido" });
+
+    const existing = await prisma.conversation.findFirst({
+      where: {
+        participants: { some: { userId: myId } },
+        AND: [{ participants: { some: { userId: otherUserId } } }],
+      },
+      include: { participants: { include: { user: true } } },
+    } as any);
+
+    if (existing) {
+      return res.json({
+        ...existing,
+        participants: (existing as any).participants.map((p: any) => ({ ...p, user: safeUser(p.user) })),
+      });
+    }
+
+    const created = await prisma.conversation.create({
+      data: {
+        participants: {
+          create: [{ userId: myId }, { userId: otherUserId }],
+        },
+      } as any,
+      include: { participants: { include: { user: true } } },
+    } as any);
+
+    return res.json({
+      ...created,
+      participants: (created as any).participants.map((p: any) => ({ ...p, user: safeUser(p.user) })),
+    });
+  } catch (e) {
+    console.error("CONV_CREATE_ERR", e);
+    return res.status(500).json({ error: "Errore creazione conversazione" });
+  }
 });
 
 app.get("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, res) => {
-  const myId = req.userId!;
-  const conversationId = Number(req.params.id);
+  try {
+    const myId = req.userId!;
+    const conversationId = Number(req.params.id);
 
-  const part = await prisma.conversationParticipant.findFirst({
-    where: { conversationId, userId: myId },
-  } as any);
-  if (!part) return res.status(403).json({ error: "Non autorizzato" });
+    const ok = await prisma.conversationParticipant.findFirst({
+      where: { conversationId, userId: myId },
+    } as any);
 
-  const msgs = await prisma.message.findMany({
-    where: { conversationId },
-    orderBy: { createdAt: "asc" },
-    include: { sender: true }, // ✅ include sender
-  } as any);
+    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
 
-  res.json(
-    msgs.map((m: any) => ({
-      ...m,
-      sender: safeUser((m as any).sender), // ✅ cast per TS
-    }))
-  );
-});
+    const messages = await prisma.message.findMany({
+      where: { conversationId },
+      orderBy: { createdAt: "asc" },
+      include: { sender: true } as any,
+    } as any);
 
-// SOCKET: join + typing + send (minimo)
-io.on("connection", (socket) => {
-  socket.on("conversation:join", ({ conversationId }: any) => {
-    if (!conversationId) return;
-    socket.join(`conv_${conversationId}`);
-  });
+    // replyTo manual (senza dipendere dalla relation Prisma)
+    const replyIds = Array.from(
+      new Set(
+        messages
+          .map((m: any) => (m.replyToId == null ? null : Number(m.replyToId)))
+          .filter((v: any) => typeof v === "number" && Number.isFinite(v))
+      )
+    );
 
-  socket.on("typing", ({ conversationId, userId }: any) => {
-    if (!conversationId) return;
-    socket.to(`conv_${conversationId}`).emit("user:typing", { conversationId, userId });
-  });
+    let replyMap: Record<number, any> = {};
+    if (replyIds.length > 0) {
+      const replied = await prisma.message.findMany({
+        where: { id: { in: replyIds } },
+        include: { sender: true } as any,
+      } as any);
 
-  socket.on("message:send", async ({ conversationId, senderId, content }: any) => {
-    try {
-      if (!conversationId || !senderId || !content) return;
-      const msg = await prisma.message.create({
-        data: { conversationId: Number(conversationId), senderId: Number(senderId), content: String(content) } as any,
-      });
-      io.to(`conv_${conversationId}`).emit("message:new", { conversationId: Number(conversationId), message: msg });
-    } catch (e) {
-      console.error("SOCKET_SEND_ERR", e);
+      replyMap = Object.fromEntries(
+        replied.map((m: any) => [
+          m.id,
+          { ...m, sender: safeUser(m.sender) },
+        ])
+      );
     }
-  });
+
+    return res.json(
+      messages.map((m: any) => ({
+        ...m,
+        sender: safeUser(m.sender),
+        replyTo: m.replyToId ? replyMap[Number(m.replyToId)] || null : null,
+      }))
+    );
+  } catch (e) {
+    console.error("MSG_LIST_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento messaggi" });
+  }
 });
 
+// invio messaggio via HTTP (fallback)
+app.post("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const conversationId = Number(req.params.id);
+    const content = String(req.body?.content || "").trim();
+    const replyToId = req.body?.replyToId == null ? null : Number(req.body.replyToId);
+
+    if (!content) return res.status(400).json({ error: "Messaggio vuoto" });
+
+    const ok = await prisma.conversationParticipant.findFirst({
+      where: { conversationId, userId: myId },
+    } as any);
+    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
+
+    const msg = await prisma.message.create({
+      data: { conversationId, senderId: myId, content, replyToId } as any,
+      include: { sender: true } as any,
+    } as any);
+
+    const payload = { ...msg, sender: safeUser((msg as any).sender) };
+    io.to(`conv_${conversationId}`).emit("message:new", { conversationId, message: payload });
+
+    return res.json(payload);
+  } catch (e) {
+    console.error("MSG_SEND_ERR", e);
+    return res.status(500).json({ error: "Errore invio messaggio" });
+  }
+});
+
+// edit messaggio
+app.patch("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const id = Number(req.params.id);
+    const content = String(req.body?.content || "").trim();
+    if (!content) return res.status(400).json({ error: "Contenuto vuoto" });
+
+    const msg0 = await prisma.message.findUnique({ where: { id } } as any);
+    if (!msg0) return res.status(404).json({ error: "Messaggio non trovato" });
+    if ((msg0 as any).senderId !== myId) return res.status(403).json({ error: "Non autorizzato" });
+
+    const msg = await prisma.message.update({
+      where: { id },
+      data: { content, editedAt: new Date() } as any,
+      include: { sender: true } as any,
+    } as any);
+
+    const payload = { ...msg, sender: safeUser((msg as any).sender) };
+    io.to(`conv_${(msg as any).conversationId}`).emit("message:updated", { conversationId: (msg as any).conversationId, message: payload });
+
+    return res.json(payload);
+  } catch (e) {
+    console.error("MSG_EDIT_ERR", e);
+    return res.status(500).json({ error: "Errore modifica messaggio" });
+  }
+});
+
+// delete messaggio (soft)
+app.delete("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const id = Number(req.params.id);
+
+    const msg0 = await prisma.message.findUnique({ where: { id } } as any);
+    if (!msg0) return res.status(404).json({ error: "Messaggio non trovato" });
+    if ((msg0 as any).senderId !== myId) return res.status(403).json({ error: "Non autorizzato" });
+
+    const msg = await prisma.message.update({
+      where: { id },
+      data: { deletedAt: new Date(), content: "" } as any,
+      include: { sender: true } as any,
+    } as any);
+
+    const payload = { ...msg, sender: safeUser((msg as any).sender) };
+    io.to(`conv_${(msg as any).conversationId}`).emit("message:deleted", { conversationId: (msg as any).conversationId, message: payload });
+
+    return res.json(payload);
+  } catch (e) {
+    console.error("MSG_DELETE_ERR", e);
+    return res.status(500).json({ error: "Errore eliminazione messaggio" });
+  }
+});
+
+// delete conversazione
+app.delete("/conversations/:id", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const conversationId = Number(req.params.id);
+
+    const ok = await prisma.conversationParticipant.findFirst({
+      where: { conversationId, userId: myId },
+    } as any);
+    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
+
+    await prisma.$transaction([
+      prisma.message.deleteMany({ where: { conversationId } } as any),
+      prisma.conversationParticipant.deleteMany({ where: { conversationId } } as any),
+      prisma.conversation.delete({ where: { id: conversationId } } as any),
+    ] as any);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("CONV_DELETE_ERR", e);
+    return res.status(500).json({ error: "Errore eliminazione conversazione" });
+  }
+});
+
+/** ===== Error handling ===== */
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   console.error("UNHANDLED_ERR", err);
-  res.status(500).json({ error: "Errore server" });
+  return res.status(500).json({ error: "Errore server" });
 });
 
-server.listen(PORT, () => {
-  console.log(`Backend online su :${PORT}`);
+app.use((_req, res) => {
+  return res.status(404).json({ error: "Not found" });
+});
+
+httpServer.listen(PORT, () => {
+  console.log(`Backend online su http://localhost:${PORT}`);
 });
