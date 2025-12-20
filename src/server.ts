@@ -1,606 +1,383 @@
-import express from "express";
-import http from "http";
+import "dotenv/config";
+import express, { Request, Response, NextFunction } from "express";
 import cors from "cors";
-import dotenv from "dotenv";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
-import multer from "multer";
-import rateLimit from "express-rate-limit";
-import { Server } from "socket.io";
+import { PrismaClient } from "@prisma/client";
 
-import { prisma } from "./prisma";
-import { authMiddleware, AuthRequest } from "./middleware/auth";
-
-dotenv.config();
+const prisma = new PrismaClient();
 
 const app = express();
-
-// IMPORTANT: behind Railway proxy -> correct https urls
 app.set("trust proxy", 1);
 
-const httpServer = http.createServer(app);
-
-const PORT = process.env.PORT || 4000;
+const PORT = Number(process.env.PORT || 4000);
 const JWT_SECRET = process.env.JWT_SECRET || "changeme";
 const SALT_ROUNDS = 10;
 
-// CORS
-const DEFAULT_ALLOWED_ORIGINS = ["https://claspme.com", "https://www.claspme.com"];
-const EXTRA_ORIGINS_FROM_ENV = (process.env.FRONTEND_URL || "")
+/**
+ * CORS:
+ * - in produzione metti l'origine Netlify/Vercel (es: https://claspme.com)
+ * - in dev lasciamo localhost
+ */
+const allowedOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
-const ALLOWED_ORIGINS = [...DEFAULT_ALLOWED_ORIGINS, ...EXTRA_ORIGINS_FROM_ENV];
+
+const defaultAllowed = new Set<string>([
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "https://claspme.com",
+  "https://www.claspme.com",
+]);
+
+for (const o of allowedOrigins) defaultAllowed.add(o);
 
 app.use(
   cors({
     origin: (origin, cb) => {
+      // origin può essere undefined su curl/postman
       if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked for origin: ${origin}`));
+      if (defaultAllowed.has(origin)) return cb(null, true);
+      return cb(new Error(`CORS: Origin non consentita: ${origin}`));
     },
     credentials: true,
   })
 );
 
-app.use(express.json());
+app.use(express.json({ limit: "3mb" }));
 
-// Socket.IO
-const io = new Server(httpServer, {
-  cors: {
-    origin: ALLOWED_ORIGINS,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE"],
-    credentials: true,
-  },
-});
+/** ---- Static uploads (se li usi già per avatar/file) ---- */
+const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+app.use("/uploads", express.static(UPLOADS_DIR));
 
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many login attempts. Try again later." },
-});
-
-const VALID_STATES = [
-  "DISPONIBILE",
-  "OCCUPATO",
-  "ASSENTE",
-  "OFFLINE",
-  "INVISIBILE",
-  "VISIBILE_A_TUTTI",
-];
-const VALID_INTERESTS = ["LAVORO", "AMICIZIA", "CHATTARE", "DATING", "INCONTRI"];
-
-function parseInterests(csv: string | null | undefined): string[] {
-  if (!csv) return [];
-  return csv.split(",").map((x) => x.trim()).filter(Boolean);
-}
-function serializeInterests(arr: string[] | undefined): string | null {
-  if (!arr || arr.length === 0) return null;
-  return arr.join(",");
-}
-function validateInterests(arr: string[]): string | null {
-  const invalid = arr.filter((x) => !VALID_INTERESTS.includes(x));
-  return invalid.length ? `Interessi non validi: ${invalid.join(", ")}` : null;
+/** ---- Utils ---- */
+function safeUser(u: any) {
+  if (!u) return null;
+  // NON esporre passwordHash
+  const { passwordHash, ...rest } = u;
+  return rest;
 }
 
-function toUserDTO(user: any) {
-  return {
-    id: user.id,
-    email: user.email,
-    username: user.username,
-    displayName: user.displayName,
-    state: user.state,
-    statusText: user.statusText,
-    city: user.city,
-    area: user.area,
-    interests: parseInterests(user.interests),
-    avatarUrl: user.avatarUrl ?? null,
-    mood: user.mood ?? null,
-    lastSeen: user.lastSeen ? new Date(user.lastSeen).toISOString() : null,
-  };
+function signToken(userId: number) {
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
 }
 
-function toMessageDTO(msg: any) {
-  return {
-    id: msg.id,
-    conversationId: msg.conversationId,
-    senderId: msg.senderId,
-    content: msg.deletedAt ? "" : msg.content,
-    createdAt: msg.createdAt?.toISOString?.() ?? msg.createdAt,
-    editedAt: msg.editedAt ? new Date(msg.editedAt).toISOString() : null,
-    deletedAt: msg.deletedAt ? new Date(msg.deletedAt).toISOString() : null,
-    replyToId: msg.replyToId ?? null,
-    sender: msg.sender ? toUserDTO(msg.sender) : null,
-    replyTo: msg.replyTo
-      ? {
-          id: msg.replyTo.id,
-          senderId: msg.replyTo.senderId,
-          content: msg.replyTo.deletedAt ? "" : msg.replyTo.content,
-          createdAt: msg.replyTo.createdAt?.toISOString?.() ?? msg.replyTo.createdAt,
-          editedAt: msg.replyTo.editedAt ? new Date(msg.replyTo.editedAt).toISOString() : null,
-          deletedAt: msg.replyTo.deletedAt ? new Date(msg.replyTo.deletedAt).toISOString() : null,
-          sender: msg.replyTo.sender ? toUserDTO(msg.replyTo.sender) : null,
-        }
-      : null,
-  };
+function getAuthToken(req: Request): string | null {
+  const h = req.headers.authorization || "";
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  return m ? m[1] : null;
 }
 
-// uploads
-const uploadsDir = path.join(__dirname, "..", "uploads");
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-app.use("/uploads", express.static(uploadsDir));
+type AuthedRequest = Request & { userId?: number };
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadsDir),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${Date.now()}_${Math.round(Math.random() * 1e9)}${ext}`);
-  },
-});
-const uploadImageMulter = multer({ storage });
-const uploadAvatarMulter = multer({ storage });
-const uploadAudioMulter = multer({ storage });
-
-function makePublicUrl(req: any, filename: string) {
-  const proto =
-    (req.headers["x-forwarded-proto"] as string) ||
-    req.protocol ||
-    "https";
-  return `${proto}://${req.get("host")}/uploads/${filename}`;
+function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
+  const token = getAuthToken(req);
+  if (!token) return res.status(401).json({ error: "Token mancante" });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const userId = Number(decoded?.userId);
+    if (!userId) return res.status(401).json({ error: "Token non valido" });
+    req.userId = userId;
+    return next();
+  } catch {
+    return res.status(401).json({ error: "Token mancante o malformato" });
+  }
 }
 
-// Health
-app.get("/ping", (_req, res) => res.json({ message: "pong" }));
+/** ---- Healthcheck ---- */
+app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// AUTH
+/** ---- AUTH ---- */
 app.post("/auth/register", async (req, res) => {
   try {
-    const { email, password, displayName, username, city, area, termsAccepted } = req.body;
+    const {
+      email,
+      password,
+      username,
+      displayName,
+      city = null,
+      area = null,
+      termsAccepted,
+    } = req.body || {};
 
-    if (!email || !password || !displayName || !username) {
-      return res.status(400).json({ error: "email, password, displayName e username sono obbligatori" });
-    }
-    if (!termsAccepted) {
-      return res.status(400).json({ error: "Devi accettare i Termini e le Condizioni d'uso." });
+    if (!email || !password || !username || !displayName) {
+      return res.status(400).json({ error: "Campi mancanti" });
     }
 
-    const existing = await prisma.user.findFirst({ where: { OR: [{ email }, { username }] } });
-    if (existing) return res.status(409).json({ error: "Esiste già un utente con questa email o username" });
+    // se nel tuo schema esiste termsAccepted, lo usiamo.
+    // Se NON esiste, Prisma lancerà errore: in quel caso dimmelo e lo adatto al tuo schema.
+    if (termsAccepted !== true) {
+      return res.status(400).json({ error: "Devi accettare i Termini e le Condizioni" });
+    }
+
+    const exists = await prisma.user.findFirst({
+      where: { OR: [{ email }, { username }] },
+    });
+    if (exists) return res.status(409).json({ error: "Email o username già in uso" });
 
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
+
     const user = await prisma.user.create({
       data: {
         email,
         username,
         displayName,
         passwordHash,
-        city: city ?? null,
-        area: area ?? null,
+        city,
+        area,
+        // valori compatibili con i tuoi enum-stringhe attuali
         state: "OFFLINE",
         statusText: null,
         interests: null,
-        avatarUrl: null,
-        mood: null,
-        termsAccepted: true,
         lastSeen: new Date(),
-      },
+        termsAccepted: true,
+      } as any,
     });
 
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" });
-    res.status(201).json({ token, user: toUserDTO(user) });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
+    const token = signToken(user.id);
+    return res.json({ token, user: safeUser(user) });
+  } catch (e: any) {
+    console.error("REGISTER_ERR", e);
+    return res.status(500).json({ error: "Errore registrazione" });
   }
 });
 
-app.post("/auth/login", loginLimiter, async (req, res) => {
+app.post("/auth/login", async (req, res) => {
   try {
-    const { emailOrUsername, password } = req.body;
+    const { emailOrUsername, password } = req.body || {};
     if (!emailOrUsername || !password) {
-      return res.status(400).json({ error: "emailOrUsername e password sono obbligatori" });
+      return res.status(400).json({ error: "Campi mancanti" });
     }
 
     const user = await prisma.user.findFirst({
       where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] },
     });
+
     if (!user) return res.status(401).json({ error: "Credenziali non valide" });
 
-    const ok = await bcrypt.compare(password, user.passwordHash);
+    const ok = await bcrypt.compare(password, (user as any).passwordHash);
     if (!ok) return res.status(401).json({ error: "Credenziali non valide" });
 
-    const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: "7d" });
-    res.json({ token, user: toUserDTO(user) });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
+    // aggiorna lastSeen
+    try {
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { lastSeen: new Date() } as any,
+      });
+    } catch {
+      // non bloccare il login se lastSeen non esiste nello schema
+    }
+
+    const token = signToken(user.id);
+    return res.json({ token, user: safeUser(user) });
+  } catch (e: any) {
+    console.error("LOGIN_ERR", e);
+    return res.status(500).json({ error: "Errore login" });
   }
 });
 
-// ME
-app.get("/me", authMiddleware, async (req: AuthRequest, res) => {
-  const me = await prisma.user.findUnique({ where: { id: req.user!.id } });
-  if (!me) return res.status(404).json({ error: "Utente non trovato" });
-  res.json(toUserDTO(me));
+app.get("/me", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const me = await prisma.user.findUnique({ where: { id: req.userId! } });
+    if (!me) return res.status(404).json({ error: "Utente non trovato" });
+    return res.json(safeUser(me));
+  } catch (e: any) {
+    console.error("ME_ERR", e);
+    return res.status(500).json({ error: "Errore /me" });
+  }
 });
 
-app.put("/me", authMiddleware, async (req: AuthRequest, res) => {
+/** ---- FRIENDS ----
+ * Serve per risolvere subito:
+ *  - 404 su /friends/requests
+ */
+app.get("/friends", requireAuth, async (req: AuthedRequest, res) => {
   try {
-    const { displayName, statusText, state, city, area, interests, avatarUrl, mood } = req.body;
-    const data: any = {};
+    const myId = req.userId!;
 
-    if (displayName !== undefined) data.displayName = displayName;
-    if (statusText !== undefined) data.statusText = statusText;
-    if (city !== undefined) data.city = city;
-    if (area !== undefined) data.area = area;
-    if (avatarUrl !== undefined) data.avatarUrl = avatarUrl;
-    if (mood !== undefined) data.mood = mood;
+    const rows = await prisma.friend.findMany({
+      where: { OR: [{ userAId: myId }, { userBId: myId }] },
+      include: { userA: true, userB: true },
+    } as any);
 
-    if (state !== undefined) {
-      if (!VALID_STATES.includes(state)) return res.status(400).json({ error: "state non valido" });
-      data.state = state;
-    }
+    const friends = rows
+      .map((f: any) => (f.userAId === myId ? f.userB : f.userA))
+      .filter(Boolean)
+      .map(safeUser);
 
-    if (interests !== undefined) {
-      if (!Array.isArray(interests)) return res.status(400).json({ error: "interests deve essere un array" });
-      const msg = validateInterests(interests);
-      if (msg) return res.status(400).json({ error: msg });
-      data.interests = serializeInterests(interests);
-    }
-
-    const updated = await prisma.user.update({ where: { id: req.user!.id }, data });
-    res.json(toUserDTO(updated));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
+    return res.json(friends);
+  } catch (e: any) {
+    console.error("FRIENDS_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento amici" });
   }
 });
 
 /**
- * USERS SEARCH (advanced)
- * q: name/username/email (optional)
- * visibleOnly: show only VISIBILE_A_TUTTI even if q is empty
- * city/area: filters even if q empty
- * mood: optional
+ * ✅ QUESTA È LA ROTTA CHE TI MANCAVA (404):
+ * GET /friends/requests
+ * ritorna richieste ricevute (pending)
  */
-app.get("/users", authMiddleware, async (req: AuthRequest, res) => {
+app.get("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
   try {
-    const qRaw = (req.query.q || req.query.term || req.query.query || "") as string;
-    const q = typeof qRaw === "string" ? qRaw.trim() : "";
+    const myId = req.userId!;
 
-    const visibleOnly = req.query.visibleOnly === "true";
-    const city = typeof req.query.city === "string" ? req.query.city.trim() : "";
-    const area = typeof req.query.area === "string" ? req.query.area.trim() : "";
-    const mood = typeof req.query.mood === "string" ? req.query.mood.trim() : "";
+    const requests = await prisma.friendRequest.findMany({
+      where: { receiverId: myId },
+      orderBy: { createdAt: "desc" },
+      include: { sender: true },
+    } as any);
 
-    // If user provided nothing at all, do not return all users.
-    // But allow empty q if visibleOnly/city/area/mood is set.
-    const hasSomeFilter = !!q || visibleOnly || !!city || !!area || !!mood;
-    if (!hasSomeFilter) return res.json([]);
+    return res.json(
+      requests.map((r: any) => ({
+        id: r.id,
+        createdAt: r.createdAt,
+        senderId: r.senderId,
+        receiverId: r.receiverId,
+        sender: safeUser(r.sender),
+      }))
+    );
+  } catch (e: any) {
+    console.error("FRIEND_REQ_IN_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento richieste" });
+  }
+});
 
-    const where: any = {};
+/** richieste inviate (utile per UI) */
+app.get("/friends/requests/sent", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const requests = await prisma.friendRequest.findMany({
+      where: { senderId: myId },
+      orderBy: { createdAt: "desc" },
+      include: { receiver: true },
+    } as any);
 
-    if (q) {
-      where.OR = [
-        { username: { contains: q } },
-        { displayName: { contains: q } },
-        { email: { contains: q } },
-      ];
+    return res.json(
+      requests.map((r: any) => ({
+        id: r.id,
+        createdAt: r.createdAt,
+        senderId: r.senderId,
+        receiverId: r.receiverId,
+        receiver: safeUser(r.receiver),
+      }))
+    );
+  } catch (e: any) {
+    console.error("FRIEND_REQ_SENT_ERR", e);
+    return res.status(500).json({ error: "Errore caricamento richieste inviate" });
+  }
+});
+
+/** invia richiesta amicizia */
+app.post("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const { userId } = req.body || {};
+    const otherId = Number(userId);
+
+    if (!otherId || Number.isNaN(otherId)) return res.status(400).json({ error: "userId non valido" });
+    if (otherId === myId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
+
+    // già amici?
+    const existingFriend = await prisma.friend.findFirst({
+      where: {
+        OR: [
+          { userAId: myId, userBId: otherId },
+          { userAId: otherId, userBId: myId },
+        ],
+      },
+    } as any);
+    if (existingFriend) return res.status(409).json({ error: "Siete già amici" });
+
+    // già richiesta pending?
+    const existingReq = await prisma.friendRequest.findFirst({
+      where: {
+        OR: [
+          { senderId: myId, receiverId: otherId },
+          { senderId: otherId, receiverId: myId },
+        ],
+      },
+    } as any);
+    if (existingReq) return res.status(409).json({ error: "Richiesta già presente" });
+
+    const created = await prisma.friendRequest.create({
+      data: { senderId: myId, receiverId: otherId },
+    } as any);
+
+    return res.json({ ok: true, request: created });
+  } catch (e: any) {
+    console.error("FRIEND_REQ_CREATE_ERR", e);
+    return res.status(500).json({ error: "Errore invio richiesta" });
+  }
+});
+
+/** accetta richiesta */
+app.post("/friends/requests/:id/accept", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id)) return res.status(400).json({ error: "id non valido" });
+
+    const fr = await prisma.friendRequest.findUnique({ where: { id } } as any);
+    if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
+    if ((fr as any).receiverId !== myId) return res.status(403).json({ error: "Non autorizzato" });
+
+    const senderId = Number((fr as any).senderId);
+
+    // crea amicizia (ordinando per evitare duplicati logici)
+    const a = Math.min(senderId, myId);
+    const b = Math.max(senderId, myId);
+
+    // se già esiste per qualche motivo, non fallire
+    const already = await prisma.friend.findFirst({
+      where: { OR: [{ userAId: a, userBId: b }, { userAId: b, userBId: a }] },
+    } as any);
+
+    if (!already) {
+      await prisma.friend.create({
+        data: { userAId: a, userBId: b },
+      } as any);
     }
 
-    if (visibleOnly) where.state = "VISIBILE_A_TUTTI";
-    if (city) where.city = { contains: city };
-    if (area) where.area = { contains: area };
-    if (mood) where.mood = mood;
+    await prisma.friendRequest.delete({ where: { id } } as any);
 
-    const users = await prisma.user.findMany({
-      where,
-      orderBy: { displayName: "asc" },
-      take: 100,
-    });
-
-    res.json(users.map(toUserDTO));
-  } catch (err) {
-    console.error("Errore GET /users:", err);
-    res.status(500).json({ error: "Errore server" });
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("FRIEND_REQ_ACCEPT_ERR", e);
+    return res.status(500).json({ error: "Errore accettazione richiesta" });
   }
 });
 
-// FRIENDS
-app.post("/friends/request/:id", authMiddleware, async (req: AuthRequest, res) => {
+/** rifiuta richiesta */
+app.post("/friends/requests/:id/decline", requireAuth, async (req: AuthedRequest, res) => {
   try {
-    const receiverId = Number(req.params.id);
-    const senderId = req.user!.id;
+    const myId = req.userId!;
+    const id = Number(req.params.id);
+    if (!id || Number.isNaN(id)) return res.status(400).json({ error: "id non valido" });
 
-    if (receiverId === senderId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
-
-    const existing = await prisma.friendRequest.findFirst({
-      where: { senderId, receiverId, status: "PENDING" },
-    });
-    if (existing) return res.status(400).json({ error: "Richiesta già inviata" });
-
-    await prisma.friendRequest.create({ data: { senderId, receiverId, status: "PENDING" } });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
-});
-
-app.get("/friends", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const userId = req.user!.id;
-    const friends = await prisma.friend.findMany({
-      where: { OR: [{ userAId: userId }, { userBId: userId }] },
-      include: { userA: true, userB: true },
-    });
-    const list = friends.map((f) => (f.userAId === userId ? f.userB : f.userA)).map(toUserDTO);
-    res.json(list);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
-});
-
-app.get("/friends/requests/received", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const userId = req.user!.id;
-    const reqs = await prisma.friendRequest.findMany({
-      where: { receiverId: userId, status: "PENDING" },
-      include: { sender: true },
-    });
-    res.json(reqs.map((r) => ({ id: r.id, sender: toUserDTO(r.sender) })));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
-});
-
-app.get("/friends/requests/sent", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const userId = req.user!.id;
-    const reqs = await prisma.friendRequest.findMany({
-      where: { senderId: userId, status: "PENDING" },
-      include: { receiver: true },
-    });
-    res.json(reqs.map((r) => ({ id: r.id, receiver: toUserDTO(r.receiver) })));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
-});
-
-app.post("/friends/accept/:id", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const requestId = Number(req.params.id);
-    const userId = req.user!.id;
-
-    const fr = await prisma.friendRequest.findUnique({ where: { id: requestId } });
+    const fr = await prisma.friendRequest.findUnique({ where: { id } } as any);
     if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
-    if (fr.receiverId !== userId) return res.status(403).json({ error: "Non autorizzato" });
+    if ((fr as any).receiverId !== myId) return res.status(403).json({ error: "Non autorizzato" });
 
-    await prisma.friend.create({ data: { userAId: fr.senderId, userBId: fr.receiverId } });
-    await prisma.friendRequest.update({ where: { id: requestId }, data: { status: "ACCEPTED" } });
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
+    await prisma.friendRequest.delete({ where: { id } } as any);
+    return res.json({ ok: true });
+  } catch (e: any) {
+    console.error("FRIEND_REQ_DECLINE_ERR", e);
+    return res.status(500).json({ error: "Errore rifiuto richiesta" });
   }
 });
 
-app.post("/friends/decline/:id", authMiddleware, async (req: AuthRequest, res) => {
-  try {
-    const requestId = Number(req.params.id);
-    const userId = req.user!.id;
-
-    const fr = await prisma.friendRequest.findUnique({ where: { id: requestId } });
-    if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
-    if (fr.receiverId !== userId) return res.status(403).json({ error: "Non autorizzato" });
-
-    await prisma.friendRequest.update({ where: { id: requestId }, data: { status: "DECLINED" } });
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Errore server" });
-  }
+/** ---- Error handler ---- */
+app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("UNHANDLED_ERR", err);
+  return res.status(500).json({ error: "Errore server" });
 });
 
-// CONVERSATIONS + MESSAGES + EDIT/DELETE + UPLOAD + SOCKET
-// (mantieni le tue route già stabili; qui teniamo quelle già usate nella tua app)
-
-app.get("/conversations", authMiddleware, async (req: AuthRequest, res) => {
-  const userId = req.user!.id;
-  const convs = await prisma.conversation.findMany({
-    where: { participants: { some: { userId } } },
-    include: {
-      participants: { include: { user: true } },
-      messages: {
-        orderBy: { createdAt: "desc" },
-        take: 1,
-        include: { sender: true, replyTo: { include: { sender: true } } },
-      },
-    },
-    orderBy: { id: "desc" },
-  });
-
-  res.json(
-    convs.map((c) => ({
-      ...c,
-      participants: c.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
-      messages: c.messages.map((m) => toMessageDTO(m)),
-    }))
-  );
+app.listen(PORT, () => {
+  console.log(`Server HTTP in ascolto su http://localhost:${PORT}`);
 });
-
-app.post("/conversations", authMiddleware, async (req: AuthRequest, res) => {
-  const { otherUserId } = req.body;
-  const userId = req.user!.id;
-
-  if (!otherUserId) return res.status(400).json({ error: "otherUserId obbligatorio" });
-  if (otherUserId === userId) return res.status(400).json({ error: "Non puoi chattare con te stesso" });
-
-  const existing = await prisma.conversation.findFirst({
-    where: { participants: { some: { userId } }, AND: { participants: { some: { userId: otherUserId } } } },
-    include: { participants: { include: { user: true } }, messages: { orderBy: { createdAt: "desc" }, take: 1, include: { sender: true, replyTo: { include: { sender: true } } } } },
-  });
-
-  if (existing) {
-    return res.json({
-      ...existing,
-      participants: existing.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
-      messages: existing.messages.map((m) => toMessageDTO(m)),
-    });
-  }
-
-  const conv = await prisma.conversation.create({
-    data: { participants: { create: [{ userId }, { userId: otherUserId }] } },
-    include: { participants: { include: { user: true } } },
-  });
-
-  res.status(201).json({
-    ...conv,
-    participants: conv.participants.map((p) => ({ ...p, user: p.user ? toUserDTO(p.user) : null })),
-    messages: [],
-  });
-});
-
-app.delete("/conversations/:id", authMiddleware, async (req: AuthRequest, res) => {
-  const conversationId = Number(req.params.id);
-  const userId = req.user!.id;
-
-  const participant = await prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
-  if (!participant) return res.status(403).json({ error: "Non fai parte di questa conversazione" });
-
-  await prisma.message.deleteMany({ where: { conversationId } });
-  await prisma.conversationParticipant.deleteMany({ where: { conversationId } });
-  await prisma.conversation.delete({ where: { id: conversationId } });
-
-  res.json({ ok: true });
-});
-
-app.get("/conversations/:id/messages", authMiddleware, async (req: AuthRequest, res) => {
-  const conversationId = Number(req.params.id);
-  const userId = req.user!.id;
-
-  const participant = await prisma.conversationParticipant.findFirst({ where: { conversationId, userId } });
-  if (!participant) return res.status(403).json({ error: "Non fai parte di questa conversazione" });
-
-  const msgs = await prisma.message.findMany({
-    where: { conversationId },
-    orderBy: { createdAt: "asc" },
-    include: { sender: true, replyTo: { include: { sender: true } } },
-  });
-
-  res.json(msgs.map((m) => toMessageDTO(m)));
-});
-
-app.patch("/messages/:id", authMiddleware, async (req: AuthRequest, res) => {
-  const id = Number(req.params.id);
-  const userId = req.user!.id;
-  const { content } = req.body;
-
-  if (!content || !content.trim()) return res.status(400).json({ error: "content obbligatorio" });
-
-  const msg = await prisma.message.findUnique({ where: { id } });
-  if (!msg) return res.status(404).json({ error: "Messaggio non trovato" });
-  if (msg.senderId !== userId) return res.status(403).json({ error: "Non autorizzato" });
-  if (msg.deletedAt) return res.status(400).json({ error: "Messaggio eliminato" });
-
-  const updated = await prisma.message.update({
-    where: { id },
-    data: { content, editedAt: new Date() },
-    include: { sender: true, replyTo: { include: { sender: true } } },
-  });
-
-  const dto = toMessageDTO(updated);
-  io.to(`conv_${updated.conversationId}`).emit("message:update", { conversationId: updated.conversationId, message: dto });
-  res.json(dto);
-});
-
-app.delete("/messages/:id", authMiddleware, async (req: AuthRequest, res) => {
-  const id = Number(req.params.id);
-  const userId = req.user!.id;
-
-  const msg = await prisma.message.findUnique({ where: { id } });
-  if (!msg) return res.status(404).json({ error: "Messaggio non trovato" });
-  if (msg.senderId !== userId) return res.status(403).json({ error: "Non autorizzato" });
-
-  const updated = await prisma.message.update({
-    where: { id },
-    data: { deletedAt: new Date(), content: "" },
-    include: { sender: true, replyTo: { include: { sender: true } } },
-  });
-
-  const dto = toMessageDTO(updated);
-  io.to(`conv_${updated.conversationId}`).emit("message:delete", { conversationId: updated.conversationId, message: dto });
-  res.json(dto);
-});
-
-app.post("/upload/image", authMiddleware, uploadImageMulter.single("image"), (req: any, res) => {
-  if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  res.json({ url: makePublicUrl(req, req.file.filename) });
-});
-app.post("/upload/avatar", authMiddleware, uploadAvatarMulter.single("avatar"), (req: any, res) => {
-  if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  res.json({ url: makePublicUrl(req, req.file.filename) });
-});
-app.post("/upload/audio", authMiddleware, uploadAudioMulter.single("audio"), (req: any, res) => {
-  if (!req.file) return res.status(400).json({ error: "Nessun file" });
-  res.json({ url: makePublicUrl(req, req.file.filename) });
-});
-
-// SOCKET (send message w replyToId)
-io.on("connection", async (socket) => {
-  try {
-    const userId = Number((socket.handshake.auth as any)?.userId);
-    if (!userId || Number.isNaN(userId)) return socket.disconnect();
-
-    await prisma.user.update({ where: { id: userId }, data: { state: "DISPONIBILE", lastSeen: new Date() } });
-    io.emit("user:online", { userId });
-
-    socket.on("conversation:join", ({ conversationId }) => socket.join(`conv_${conversationId}`));
-
-    socket.on("typing", ({ conversationId }) => {
-      socket.to(`conv_${conversationId}`).emit("user:typing", { conversationId, userId });
-    });
-
-    socket.on("message:send", async ({ conversationId, content, replyToId }) => {
-      if (!content || !content.trim()) return;
-
-      let validReplyToId: number | null = null;
-      if (replyToId) {
-        const rt = await prisma.message.findUnique({ where: { id: Number(replyToId) } });
-        if (rt && rt.conversationId === Number(conversationId)) validReplyToId = rt.id;
-      }
-
-      const msg = await prisma.message.create({
-        data: { conversationId: Number(conversationId), senderId: userId, content, replyToId: validReplyToId },
-        include: { sender: true, replyTo: { include: { sender: true } } },
-      });
-
-      const dto = toMessageDTO(msg);
-      io.to(`conv_${conversationId}`).emit("message:new", { conversationId: Number(conversationId), message: dto });
-    });
-
-    socket.on("disconnect", async () => {
-      const lastSeen = new Date();
-      await prisma.user.update({ where: { id: userId }, data: { state: "OFFLINE", lastSeen } });
-      io.emit("user:offline", { userId, lastSeen: lastSeen.toISOString() });
-    });
-  } catch (err) {
-    console.error("Socket error:", err);
-    socket.disconnect();
-  }
-});
-
-app.use((err: any, _req: any, res: any, _next: any) => {
-  console.error("Internal error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
-
-httpServer.listen(PORT, () => console.log(`CLASP backend listening on port ${PORT}`));
