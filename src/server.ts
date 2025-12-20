@@ -390,6 +390,46 @@ app.get("/users/search", requireAuth, async (req: AuthedRequest, res) => {
     return res.status(500).json({ error: "Errore ricerca utenti" });
   }
 });
+// ===============================
+// COMPAT: ricerca utenti via /users?q=...
+// ===============================
+app.get("/users", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const city = String(req.query.city || "").trim();
+    const area = String(req.query.area || "").trim();
+    const mood = String(req.query.mood || "").trim();
+    const state = String(req.query.state || "").trim();
+    const visibleOnly = String(req.query.visibleOnly || "").trim() === "true";
+
+    const where: any = { NOT: { id: req.userId! } };
+
+    if (q) {
+      where.OR = [
+        { username: { contains: q, mode: "insensitive" } },
+        { displayName: { contains: q, mode: "insensitive" } },
+        { email: { contains: q, mode: "insensitive" } },
+      ];
+    }
+
+    if (city) where.city = { contains: city, mode: "insensitive" };
+    if (area) where.area = { contains: area, mode: "insensitive" };
+    if (mood) where.mood = mood;
+    if (state) where.state = state;
+    if (visibleOnly) where.state = "VISIBILE_A_TUTTI";
+
+    const users = await prisma.user.findMany({
+      where,
+      orderBy: { id: "desc" },
+      take: 80,
+    } as any);
+
+    res.json(users.map(safeUser));
+  } catch (e) {
+    console.error("GET /users error:", e);
+    res.status(500).json({ error: "Errore ricerca utenti" });
+  }
+});
 
 /** FRIENDS */
 app.get("/friends", requireAuth, async (req: AuthedRequest, res) => {
