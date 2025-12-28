@@ -55,8 +55,10 @@ app.use(express.json({ limit: "10mb" }));
 const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
 const AVATAR_DIR = path.join(UPLOADS_DIR, "avatars");
 const CHAT_IMG_DIR = path.join(UPLOADS_DIR, "chat-images");
+const FILES_DIR = path.join(UPLOADS_DIR, "files");
+const AUDIO_DIR = path.join(UPLOADS_DIR, "audio");
 
-for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR]) {
+for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR, FILES_DIR, AUDIO_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -64,7 +66,11 @@ app.use("/uploads", express.static(UPLOADS_DIR));
 
 const storage = multer.diskStorage({
   destination: (req: any, file: any, cb: any) => {
-    if (file?.fieldname === "avatar") return cb(null, AVATAR_DIR);
+    const field = String(file?.fieldname || "");
+    if (field === "avatar") return cb(null, AVATAR_DIR);
+    if (field === "audio") return cb(null, AUDIO_DIR);
+    if (field === "file") return cb(null, FILES_DIR);
+    // default: immagini chat
     return cb(null, CHAT_IMG_DIR);
   },
   filename: (req: any, file: any, cb: any) => {
@@ -103,10 +109,12 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   }
 }
 
-function safeUser(u: any) {
+function safeUser(u: any, opts?: { includeEmail?: boolean }) {
   if (!u) return null;
   const { passwordHash, ...rest } = u;
-  return rest;
+  if (opts?.includeEmail) return rest;
+  const { email, ...pub } = rest;
+  return pub;
 }
 
 function signToken(userId: number) {
@@ -253,7 +261,7 @@ app.post("/auth/register", async (req, res) => {
     } as any);
 
     const token = signToken(user.id);
-    return res.json({ token, user: safeUser(user) });
+    return res.json({ token, user: safeUser(user, { includeEmail: true }) });
   } catch (e) {
     console.error("REGISTER_ERR", e);
     return res.status(500).json({ error: "Errore registrazione" });
@@ -282,7 +290,7 @@ app.post("/auth/login", async (req, res) => {
     } catch {}
 
     const token = signToken(user.id);
-    return res.json({ token, user: safeUser(user) });
+    return res.json({ token, user: safeUser(user, { includeEmail: true }) });
   } catch (e) {
     console.error("LOGIN_ERR", e);
     return res.status(500).json({ error: "Errore login" });
@@ -293,7 +301,7 @@ app.get("/me", requireAuth, async (req: AuthedRequest, res) => {
   try {
     const me = await prisma.user.findUnique({ where: { id: req.userId! } } as any);
     if (!me) return res.status(404).json({ error: "Utente non trovato" });
-    return res.json(safeUser(me));
+    return res.json(safeUser(me, { includeEmail: true }));
   } catch (e) {
     console.error("ME_ERR", e);
     return res.status(500).json({ error: "Errore /me" });
@@ -316,7 +324,7 @@ app.patch("/me", requireAuth, async (req: AuthedRequest, res) => {
       data,
     } as any);
 
-    return res.json(safeUser(updated));
+    return res.json(safeUser(updated, { includeEmail: true }));
   } catch (e) {
     console.error("ME_PATCH_ERR", e);
     return res.status(500).json({ error: "Errore aggiornamento profilo" });
@@ -335,7 +343,7 @@ app.post("/upload/avatar", requireAuth, upload.single("avatar"), async (req: any
       data: { avatarUrl } as any,
     } as any);
 
-    return res.json({ ok: true, avatarUrl, user: safeUser(updated) });
+    return res.json({ ok: true, avatarUrl, user: safeUser(updated, { includeEmail: true }) });
   } catch (e) {
     console.error("UPLOAD_AVATAR_ERR", e);
     return res.status(500).json({ error: "Errore upload avatar" });
@@ -351,6 +359,30 @@ app.post("/upload/image", requireAuth, upload.single("image"), async (req: any, 
   } catch (e) {
     console.error("UPLOAD_IMAGE_ERR", e);
     return res.status(500).json({ error: "Errore upload immagine" });
+  }
+});
+
+// Upload file generico (documenti, ecc.)
+app.post("/upload/file", requireAuth, upload.single("file"), async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+    const url = `/uploads/files/${req.file.filename}`;
+    return res.json({ ok: true, url });
+  } catch (e) {
+    console.error("UPLOAD_FILE_ERR", e);
+    return res.status(500).json({ error: "Errore upload file" });
+  }
+});
+
+// Upload audio (vocali)
+app.post("/upload/audio", requireAuth, upload.single("audio"), async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+    const url = `/uploads/audio/${req.file.filename}`;
+    return res.json({ ok: true, url });
+  } catch (e) {
+    console.error("UPLOAD_AUDIO_ERR", e);
+    return res.status(500).json({ error: "Errore upload audio" });
   }
 });
 
@@ -384,7 +416,7 @@ app.get("/users/search", requireAuth, async (req: AuthedRequest, res) => {
       take: 80,
     } as any);
 
-    return res.json(users.map(safeUser));
+    return res.json(users.map((u: any) => safeUser(u)));
   } catch (e) {
     console.error("USER_SEARCH_ERR", e);
     return res.status(500).json({ error: "Errore ricerca utenti" });
@@ -424,7 +456,7 @@ app.get("/users", requireAuth, async (req: AuthedRequest, res) => {
       take: 80,
     } as any);
 
-    res.json(users.map(safeUser));
+    res.json(users.map((u: any) => safeUser(u)));
   } catch (e) {
     console.error("GET /users error:", e);
     res.status(500).json({ error: "Errore ricerca utenti" });
@@ -443,7 +475,7 @@ app.get("/friends", requireAuth, async (req: AuthedRequest, res) => {
     const friends = rows
       .map((f: any) => (f.userAId === myId ? f.userB : f.userA))
       .filter(Boolean)
-      .map(safeUser);
+      .map((u: any) => safeUser(u));
 
     return res.json(friends);
   } catch (e) {
@@ -516,7 +548,16 @@ app.get("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
 app.post("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
   try {
     const myId = req.userId!;
-    const otherId = Number(req.body?.userId);
+
+    // ✅ compat: accetta diversi nomi del campo per l'id destinatario
+    const raw =
+      (req.body?.userId ??
+        req.body?.receiverId ??
+        req.body?.otherUserId ??
+        req.body?.targetUserId ??
+        req.body?.toUserId) as any;
+
+    const otherId = Number(raw);
 
     if (!otherId || Number.isNaN(otherId)) return res.status(400).json({ error: "userId non valido" });
     if (otherId === myId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
@@ -542,11 +583,14 @@ app.post("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
     if (existingReq) return res.status(409).json({ error: "Richiesta già presente" });
 
     const fr = await prisma.friendRequest.create({
-      data: { senderId: myId, receiverId: otherId } as any,
+      data: { senderId: myId, receiverId: otherId, status: "PENDING" } as any,
     } as any);
 
     return res.json({ ok: true, request: fr });
-  } catch (e) {
+  } catch (e: any) {
+    // ✅ se scatta la unique constraint (race condition) rispondo 409 invece di 500
+    if (e?.code === "P2002") return res.status(409).json({ error: "Richiesta già presente" });
+
     console.error("REQ_CREATE_ERR", e);
     return res.status(500).json({ error: "Errore invio richiesta" });
   }
@@ -758,6 +802,37 @@ app.post("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, 
     return res.json(payload);
   } catch (e) {
     console.error("MSG_SEND_ERR", e);
+    return res.status(500).json({ error: "Errore invio messaggio" });
+  }
+});
+
+// invio messaggio via endpoint compat /messages (fallback di alcuni frontend)
+app.post("/messages", requireAuth, async (req: AuthedRequest, res) => {
+  try {
+    const myId = req.userId!;
+    const conversationId = Number(req.body?.conversationId);
+    const content = String(req.body?.content || req.body?.text || req.body?.message || "").trim();
+    const replyToId = req.body?.replyToId == null ? null : Number(req.body.replyToId);
+
+    if (!conversationId || Number.isNaN(conversationId)) return res.status(400).json({ error: "conversationId non valido" });
+    if (!content) return res.status(400).json({ error: "Messaggio vuoto" });
+
+    const ok = await prisma.conversationParticipant.findFirst({
+      where: { conversationId, userId: myId },
+    } as any);
+    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
+
+    const msg = await prisma.message.create({
+      data: { conversationId, senderId: myId, content, replyToId } as any,
+      include: { sender: true } as any,
+    } as any);
+
+    const payload = { ...msg, sender: safeUser((msg as any).sender) };
+    io.to(`conv_${conversationId}`).emit("message:new", { conversationId, message: payload });
+
+    return res.json(payload);
+  } catch (e) {
+    console.error("MSG_SEND_COMPAT_ERR", e);
     return res.status(500).json({ error: "Errore invio messaggio" });
   }
 });
