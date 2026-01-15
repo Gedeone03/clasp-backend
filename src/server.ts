@@ -17,6 +17,7 @@ const multer = require("multer") as any;
 const prisma = new PrismaClient();
 
 const app = express();
+console.log("BOOT_MARKER dfeb9f9");
 app.get("/__version", (_req, res) => {
   res.json({
     service: "clasp-backend",
