@@ -17,6 +17,14 @@ const multer = require("multer") as any;
 const prisma = new PrismaClient();
 
 const app = express();
+app.get("/__version", (_req, res) => {
+  res.json({
+    service: "clasp-backend",
+    time: new Date().toISOString(),
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || null,
+  });
+});
+
 const httpServer = http.createServer(app);
 
 app.set("trust proxy", 1);
