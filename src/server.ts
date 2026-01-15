@@ -1,3 +1,4 @@
+import type { Secret, SignOptions } from "jsonwebtoken";
 import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import http from "http";
@@ -483,10 +484,10 @@ app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
         const pwSig = String((user as any).passwordHash || "").slice(0, 12);
 
         const token = jwt.sign(
-          { userId: (user as any).id, pw: pwSig },
-          RESET_JWT_SECRET,
-          { expiresIn: RESET_JWT_EXPIRES }
-        );
+  { userId: (user as any).id, pw: pwSig },
+  RESET_JWT_SECRET as Secret,
+  { expiresIn: RESET_JWT_EXPIRES as any } as SignOptions
+);
 
         const link = `${APP_URL}/reset-password?token=${encodeURIComponent(token)}`;
 
