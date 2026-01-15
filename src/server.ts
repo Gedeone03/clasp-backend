@@ -14,10 +14,16 @@ import rateLimit from "express-rate-limit";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const multer = require("multer") as any;
 
+// Nodemailer: uso require per evitare problemi di typings in build
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodemailer = require("nodemailer") as any;
+
 const prisma = new PrismaClient();
 
 const app = express();
+
 console.log("BOOT_MARKER dfeb9f9");
+
 app.get("/__version", (_req, res) => {
   res.json({
     service: "clasp-backend",
@@ -106,13 +112,19 @@ const searchLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-
-
 app.use(cors(corsOptions));
 // Preflight esplicito (sicuro)
 app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "10mb" }));
+
+// ✅ JSON malformato → 400 (non 500)
+app.use((err: any, _req: any, res: any, next: any) => {
+  if (err?.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "JSON non valido" });
+  }
+  return next(err);
+});
 
 /** ===== Uploads (avatar + immagini chat) =====
  *  Nota: per persistenza su Railway, monta un Volume su /app/uploads
@@ -132,14 +144,17 @@ for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR, FILES_DIR, AUDIO_DIR])
 }
 
 // pubblico
-app.use("/uploads", express.static(UPLOADS_DIR, {
-  setHeaders(res) {
-    res.setHeader("X-Content-Type-Options", "nosniff");
-  },
-}));
+app.use(
+  "/uploads",
+  express.static(UPLOADS_DIR, {
+    setHeaders(res) {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    },
+  })
+);
 
 const storage = multer.diskStorage({
-  destination: (req: any, file: any, cb: any) => {
+  destination: (_req: any, file: any, cb: any) => {
     const field = String(file?.fieldname || "");
     if (field === "avatar") return cb(null, AVATAR_DIR);
     if (field === "audio") return cb(null, AUDIO_DIR);
@@ -147,7 +162,7 @@ const storage = multer.diskStorage({
     // default: immagini chat
     return cb(null, CHAT_IMG_DIR);
   },
-  filename: (req: any, file: any, cb: any) => {
+  filename: (_req: any, file: any, cb: any) => {
     const ext = path.extname(file.originalname || "").slice(0, 12) || "";
     const safe = `${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`;
     cb(null, safe);
@@ -407,8 +422,6 @@ app.post("/auth/login", authLimiter, async (req, res) => {
     return res.status(500).json({ error: "Errore login" });
   }
 });
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const nodemailer = require("nodemailer") as any;
 
 const RESET_JWT_SECRET = process.env.RESET_JWT_SECRET || `${JWT_SECRET}__reset`;
 const RESET_JWT_EXPIRES = process.env.RESET_JWT_EXPIRES || "30m"; // 30 minuti
@@ -452,41 +465,41 @@ async function sendResetEmail(to: string, link: string) {
 }
 
 // ===== AUTH: Password reset request =====
-app.post("/auth/password-reset/request", async (req, res) => {
-  const email = String(req.body?.email || "").trim().toLowerCase();
+// ✅ COERENTE con /auth/password-reset/confirm: genera un JWT reset, non usa funzioni inesistenti.
+app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
 
-  // Risposta immediata (non rivela se l’email esiste)
-  res.json({ ok: true });
+    // risposta sempre generica (non rivela se l’email esiste)
+    res.json({ ok: true });
 
-  setImmediate(async () => {
-    try {
-      if (!email) return;
-
-      const user = await prisma.user.findUnique({ where: { email } });
-      if (!user) return;
-
-      const token = crypto.randomBytes(32).toString("hex");
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
-
-      await prisma.passwordResetToken.create({
-        data: { userId: user.id, token, expiresAt },
-      });
-
-      // Se SMTP non è configurato, non provare neanche
-      if (!process.env.SMTP_HOST || !process.env.SMTP_PORT) {
-        console.warn("PASSWORD_RESET: SMTP not configured, skipping email send");
-        return;
-      }
-
+    setImmediate(async () => {
       try {
-        await sendPasswordResetEmail({ to: email, token });
-      } catch (mailErr) {
-        console.error("PASSWORD_RESET_EMAIL_ERR", mailErr);
+        if (!email) return;
+
+        const user = await prisma.user.findUnique({ where: { email } } as any);
+        if (!user) return;
+
+        const pwSig = String((user as any).passwordHash || "").slice(0, 12);
+
+        const token = jwt.sign(
+          { userId: (user as any).id, pw: pwSig },
+          RESET_JWT_SECRET,
+          { expiresIn: RESET_JWT_EXPIRES }
+        );
+
+        const link = `${APP_URL}/reset-password?token=${encodeURIComponent(token)}`;
+
+        await sendResetEmail(email, link);
+      } catch (err) {
+        console.error("PASSWORD_RESET_BG_ERR", err);
       }
-    } catch (err) {
-      console.error("PASSWORD_RESET_BG_ERR", err);
-    }
-  });
+    });
+  } catch (e) {
+    console.error("PASSWORD_RESET_REQUEST_ERR", e);
+    // anche in errore rispondi ok (no leak)
+    try { res.json({ ok: true }); } catch {}
+  }
 });
 
 // ===== AUTH: Password reset confirm =====
@@ -654,6 +667,7 @@ app.get("/users/search", searchLimiter, requireAuth, async (req: AuthedRequest, 
     return res.status(500).json({ error: "Errore ricerca utenti" });
   }
 });
+
 // ===============================
 // COMPAT: ricerca utenti via /users?q=...
 // ===============================
@@ -692,446 +706,6 @@ app.get("/users", searchLimiter, requireAuth, async (req: AuthedRequest, res) =>
   } catch (e) {
     console.error("GET /users error:", e);
     res.status(500).json({ error: "Errore ricerca utenti" });
-  }
-});
-
-/** FRIENDS */
-app.get("/friends", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const rows = await prisma.friend.findMany({
-      where: { OR: [{ userAId: myId }, { userBId: myId }] },
-      include: { userA: true, userB: true },
-    } as any);
-
-    const friends = rows
-      .map((f: any) => (f.userAId === myId ? f.userB : f.userA))
-      .filter(Boolean)
-      .map((u: any) => safeUser(u));
-
-    return res.json(friends);
-  } catch (e) {
-    console.error("FRIENDS_ERR", e);
-    return res.status(500).json({ error: "Errore caricamento amici" });
-  }
-});
-
-// richieste ricevute
-app.get("/friends/requests/received", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const requests = await prisma.friendRequest.findMany({
-      where: { receiverId: myId },
-      orderBy: { createdAt: "desc" },
-      include: { sender: true },
-    } as any);
-
-    return res.json(
-      requests.map((r: any) => ({
-        id: r.id,
-        createdAt: r.createdAt,
-        senderId: r.senderId,
-        receiverId: r.receiverId,
-        sender: safeUser(r.sender),
-      }))
-    );
-  } catch (e) {
-    console.error("REQ_RECEIVED_ERR", e);
-    return res.status(500).json({ error: "Errore caricamento richieste" });
-  }
-});
-
-// richieste inviate
-app.get("/friends/requests/sent", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const requests = await prisma.friendRequest.findMany({
-      where: { senderId: myId },
-      orderBy: { createdAt: "desc" },
-      include: { receiver: true },
-    } as any);
-
-    return res.json(
-      requests.map((r: any) => ({
-        id: r.id,
-        createdAt: r.createdAt,
-        senderId: r.senderId,
-        receiverId: r.receiverId,
-        receiver: safeUser(r.receiver),
-      }))
-    );
-  } catch (e) {
-    console.error("REQ_SENT_ERR", e);
-    return res.status(500).json({ error: "Errore caricamento richieste inviate" });
-  }
-});
-
-// alias compat (alcune versioni del frontend chiamano /friends/requests)
-app.get("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
-  // per compat: rimando le ricevute
-  return app._router.handle(
-    { ...req, url: "/friends/requests/received", path: "/friends/requests/received" } as any,
-    res,
-    (() => {}) as any
-  );
-});
-
-// invio richiesta amicizia
-app.post("/friends/requests", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const otherId = Number(req.body?.userId);
-
-    if (!otherId || Number.isNaN(otherId)) return res.status(400).json({ error: "userId non valido" });
-    if (otherId === myId) return res.status(400).json({ error: "Non puoi aggiungere te stesso" });
-
-    const alreadyFriend = await prisma.friend.findFirst({
-      where: {
-        OR: [
-          { userAId: myId, userBId: otherId },
-          { userAId: otherId, userBId: myId },
-        ],
-      },
-    } as any);
-    if (alreadyFriend) return res.status(409).json({ error: "Siete già amici" });
-
-    const existingReq = await prisma.friendRequest.findFirst({
-      where: {
-        OR: [
-          { senderId: myId, receiverId: otherId },
-          { senderId: otherId, receiverId: myId },
-        ],
-      },
-    } as any);
-    if (existingReq) return res.status(409).json({ error: "Richiesta già presente" });
-
-    const fr = await prisma.friendRequest.create({
-      data: { senderId: myId, receiverId: otherId, status: "PENDING" } as any,
-    } as any);
-
-    return res.json({ ok: true, request: fr });
-  } catch (e) {
-    console.error("REQ_CREATE_ERR", e);
-    return res.status(500).json({ error: "Errore invio richiesta" });
-  }
-});
-
-app.post("/friends/requests/:id/accept", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const id = Number(req.params.id);
-    if (!id || Number.isNaN(id)) return res.status(400).json({ error: "id non valido" });
-
-    const fr = await prisma.friendRequest.findUnique({ where: { id } } as any);
-    if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
-    if ((fr as any).receiverId !== myId) return res.status(403).json({ error: "Non autorizzato" });
-
-    const senderId = Number((fr as any).senderId);
-    const a = Math.min(senderId, myId);
-    const b = Math.max(senderId, myId);
-
-    const already = await prisma.friend.findFirst({
-      where: { OR: [{ userAId: a, userBId: b }, { userAId: b, userBId: a }] },
-    } as any);
-
-    if (!already) {
-      await prisma.friend.create({ data: { userAId: a, userBId: b } as any } as any);
-    }
-
-    await prisma.friendRequest.delete({ where: { id } } as any);
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("REQ_ACCEPT_ERR", e);
-    return res.status(500).json({ error: "Errore accettazione richiesta" });
-  }
-});
-
-app.post("/friends/requests/:id/decline", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const id = Number(req.params.id);
-    if (!id || Number.isNaN(id)) return res.status(400).json({ error: "id non valido" });
-
-    const fr = await prisma.friendRequest.findUnique({ where: { id } } as any);
-    if (!fr) return res.status(404).json({ error: "Richiesta non trovata" });
-    if ((fr as any).receiverId !== myId) return res.status(403).json({ error: "Non autorizzato" });
-
-    await prisma.friendRequest.delete({ where: { id } } as any);
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("REQ_DECLINE_ERR", e);
-    return res.status(500).json({ error: "Errore rifiuto richiesta" });
-  }
-});
-
-/** CONVERSATIONS */
-app.get("/conversations", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-
-    const convs = await prisma.conversation.findMany({
-      where: { participants: { some: { userId: myId } } },
-      include: {
-        participants: { include: { user: true } },
-        messages: {
-          orderBy: { createdAt: "desc" },
-          take: 1,
-          include: { sender: true } as any,
-        },
-      },
-      orderBy: { id: "desc" },
-    } as any);
-
-    return res.json(
-      convs.map((c: any) => {
-        const participants = (c.participants || []).map((p: any) => ({ ...p, user: safeUser(p.user) }));
-        const last = (c.messages && c.messages[0]) ? { ...c.messages[0], sender: safeUser(c.messages[0].sender) } : null;
-        return {
-          ...c,
-          participants,
-          lastMessage: last,
-        };
-      })
-    );
-  } catch (e) {
-    console.error("CONV_LIST_ERR", e);
-    return res.status(500).json({ error: "Errore caricamento conversazioni" });
-  }
-});
-
-// crea o recupera chat 1-1
-app.post("/conversations", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const otherUserId = Number(req.body?.otherUserId);
-
-    if (!otherUserId || Number.isNaN(otherUserId)) return res.status(400).json({ error: "otherUserId non valido" });
-    if (otherUserId === myId) return res.status(400).json({ error: "Non valido" });
-
-    const existing = await prisma.conversation.findFirst({
-      where: {
-        participants: { some: { userId: myId } },
-        AND: [{ participants: { some: { userId: otherUserId } } }],
-      },
-      include: { participants: { include: { user: true } } },
-    } as any);
-
-    if (existing) {
-      return res.json({
-        ...existing,
-        participants: (existing as any).participants.map((p: any) => ({ ...p, user: safeUser(p.user) })),
-      });
-    }
-
-    const created = await prisma.conversation.create({
-      data: {
-        participants: {
-          create: [{ userId: myId }, { userId: otherUserId }],
-        },
-      } as any,
-      include: { participants: { include: { user: true } } },
-    } as any);
-
-    return res.json({
-      ...created,
-      participants: (created as any).participants.map((p: any) => ({ ...p, user: safeUser(p.user) })),
-    });
-  } catch (e) {
-    console.error("CONV_CREATE_ERR", e);
-    return res.status(500).json({ error: "Errore creazione conversazione" });
-  }
-});
-
-app.get("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const conversationId = Number(req.params.id);
-
-    const ok = await prisma.conversationParticipant.findFirst({
-      where: { conversationId, userId: myId },
-    } as any);
-
-    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
-
-    const messages = await prisma.message.findMany({
-      where: { conversationId },
-      orderBy: { createdAt: "asc" },
-      include: { sender: true } as any,
-    } as any);
-
-    // replyTo manual (senza dipendere dalla relation Prisma)
-    const replyIds = Array.from(
-      new Set(
-        messages
-          .map((m: any) => (m.replyToId == null ? null : Number(m.replyToId)))
-          .filter((v: any) => typeof v === "number" && Number.isFinite(v))
-      )
-    );
-
-    let replyMap: Record<number, any> = {};
-    if (replyIds.length > 0) {
-      const replied = await prisma.message.findMany({
-        where: { id: { in: replyIds } },
-        include: { sender: true } as any,
-      } as any);
-
-      replyMap = Object.fromEntries(
-        replied.map((m: any) => [
-          m.id,
-          { ...m, sender: safeUser(m.sender) },
-        ])
-      );
-    }
-
-    return res.json(
-      messages.map((m: any) => ({
-        ...m,
-        sender: safeUser(m.sender),
-        replyTo: m.replyToId ? replyMap[Number(m.replyToId)] || null : null,
-      }))
-    );
-  } catch (e) {
-    console.error("MSG_LIST_ERR", e);
-    return res.status(500).json({ error: "Errore caricamento messaggi" });
-  }
-});
-
-// invio messaggio via HTTP (fallback)
-app.post("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const conversationId = Number(req.params.id);
-    const content = String(req.body?.content || "").trim();
-    const replyToId = req.body?.replyToId == null ? null : Number(req.body.replyToId);
-
-    if (!content) return res.status(400).json({ error: "Messaggio vuoto" });
-
-    const ok = await prisma.conversationParticipant.findFirst({
-      where: { conversationId, userId: myId },
-    } as any);
-    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
-
-    const msg = await prisma.message.create({
-      data: { conversationId, senderId: myId, content, replyToId } as any,
-      include: { sender: true } as any,
-    } as any);
-
-    const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${conversationId}`).emit("message:new", { conversationId, message: payload });
-
-    return res.json(payload);
-  } catch (e) {
-    console.error("MSG_SEND_ERR", e);
-    return res.status(500).json({ error: "Errore invio messaggio" });
-  }
-});
-
-// invio messaggio via endpoint compat /messages (fallback di alcuni frontend)
-app.post("/messages", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const conversationId = Number(req.body?.conversationId);
-    const content = String(req.body?.content || req.body?.text || req.body?.message || "").trim();
-    const replyToId = req.body?.replyToId == null ? null : Number(req.body.replyToId);
-
-    if (!conversationId || Number.isNaN(conversationId)) return res.status(400).json({ error: "conversationId non valido" });
-    if (!content) return res.status(400).json({ error: "Messaggio vuoto" });
-
-    const ok = await prisma.conversationParticipant.findFirst({
-      where: { conversationId, userId: myId },
-    } as any);
-    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
-
-    const msg = await prisma.message.create({
-      data: { conversationId, senderId: myId, content, replyToId } as any,
-      include: { sender: true } as any,
-    } as any);
-
-    const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${conversationId}`).emit("message:new", { conversationId, message: payload });
-
-    return res.json(payload);
-  } catch (e) {
-    console.error("MSG_SEND_COMPAT_ERR", e);
-    return res.status(500).json({ error: "Errore invio messaggio" });
-  }
-});
-
-// edit messaggio
-app.patch("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const id = Number(req.params.id);
-    const content = String(req.body?.content || "").trim();
-    if (!content) return res.status(400).json({ error: "Contenuto vuoto" });
-
-    const msg0 = await prisma.message.findUnique({ where: { id } } as any);
-    if (!msg0) return res.status(404).json({ error: "Messaggio non trovato" });
-    if ((msg0 as any).senderId !== myId) return res.status(403).json({ error: "Non autorizzato" });
-
-    const msg = await prisma.message.update({
-      where: { id },
-      data: { content, editedAt: new Date() } as any,
-      include: { sender: true } as any,
-    } as any);
-
-    const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${(msg as any).conversationId}`).emit("message:updated", { conversationId: (msg as any).conversationId, message: payload });
-
-    return res.json(payload);
-  } catch (e) {
-    console.error("MSG_EDIT_ERR", e);
-    return res.status(500).json({ error: "Errore modifica messaggio" });
-  }
-});
-
-// delete messaggio (soft)
-app.delete("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const id = Number(req.params.id);
-
-    const msg0 = await prisma.message.findUnique({ where: { id } } as any);
-    if (!msg0) return res.status(404).json({ error: "Messaggio non trovato" });
-    if ((msg0 as any).senderId !== myId) return res.status(403).json({ error: "Non autorizzato" });
-
-    const msg = await prisma.message.update({
-      where: { id },
-      data: { deletedAt: new Date(), content: "" } as any,
-      include: { sender: true } as any,
-    } as any);
-
-    const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${(msg as any).conversationId}`).emit("message:deleted", { conversationId: (msg as any).conversationId, message: payload });
-
-    return res.json(payload);
-  } catch (e) {
-    console.error("MSG_DELETE_ERR", e);
-    return res.status(500).json({ error: "Errore eliminazione messaggio" });
-  }
-});
-
-// delete conversazione
-app.delete("/conversations/:id", requireAuth, async (req: AuthedRequest, res) => {
-  try {
-    const myId = req.userId!;
-    const conversationId = Number(req.params.id);
-
-    const ok = await prisma.conversationParticipant.findFirst({
-      where: { conversationId, userId: myId },
-    } as any);
-    if (!ok) return res.status(403).json({ error: "Non autorizzato" });
-
-    await prisma.$transaction([
-      prisma.message.deleteMany({ where: { conversationId } } as any),
-      prisma.conversationParticipant.deleteMany({ where: { conversationId } } as any),
-      prisma.conversation.delete({ where: { id: conversationId } } as any),
-    ] as any);
-
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error("CONV_DELETE_ERR", e);
-    return res.status(500).json({ error: "Errore eliminazione conversazione" });
   }
 });
 
