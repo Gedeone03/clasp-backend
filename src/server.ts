@@ -928,4 +928,3 @@ app.use((_req, res) => {
 httpServer.listen(PORT, () => {
   console.log(`Backend online su http://localhost:${PORT}`);
 });
-Fix friend requests 500
