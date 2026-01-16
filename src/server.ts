@@ -6,8 +6,10 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import path from "path";
 import fs from "fs";
+import * as nodeCrypto from "crypto";
 import { PrismaClient } from "@prisma/client";
 import { Server as SocketIOServer } from "socket.io";
+import rateLimit from "express-rate-limit";
 
 // Multer: uso require per evitare problemi di typings in build
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -16,14 +18,29 @@ const multer = require("multer") as any;
 const prisma = new PrismaClient();
 
 const app = express();
+console.log("BOOT_MARKER dfeb9f9");
+app.get("/__version", (_req, res) => {
+  res.json({
+    service: "clasp-backend",
+    time: new Date().toISOString(),
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || null,
+  });
+});
+
 const httpServer = http.createServer(app);
 
 app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT || 4000);
-const JWT_SECRET = process.env.JWT_SECRET || "changeme";
+const JWT_SECRET = process.env.JWT_SECRET || "dev-only-secret";
+if (!process.env.JWT_SECRET && process.env.NODE_ENV === "production") {
+  throw new Error("Missing JWT_SECRET in production");
+}
+
 const SALT_ROUNDS = 10;
 
+// -------------------- CORS (robusto, senza throw) --------------------
+// Origini base
 const defaultOrigins = [
   "http://localhost:5173",
   "http://127.0.0.1:5173",
@@ -31,6 +48,7 @@ const defaultOrigins = [
   "https://www.claspme.com",
 ];
 
+// Origini extra via env (comma-separated)
 const extraOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
   .map((s) => s.trim())
@@ -38,21 +56,71 @@ const extraOrigins = (process.env.CORS_ORIGINS || "")
 
 const allowedOrigins = new Set([...defaultOrigins, ...extraOrigins]);
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin) return cb(null, true);
-      if (allowedOrigins.has(origin)) return cb(null, true);
-      return cb(new Error(`CORS blocked: ${origin}`));
-    },
-    credentials: true,
-  })
+// Netlify preview del tuo sito (modifica il nome se cambia)
+const NETLIFY_SITE = process.env.NETLIFY_SITE || "unrivaled-trifle-02bba5";
+const NETLIFY_PREVIEW_RE = new RegExp(
+  `^https:\\/\\/[a-z0-9-]+--${NETLIFY_SITE}\\.netlify\\.app$`,
+  "i"
 );
+const NETLIFY_PROD_RE = new RegExp(`^https:\\/\\/${NETLIFY_SITE}\\.netlify\\.app$`, "i");
+
+function isAllowedOrigin(origin?: string): boolean {
+  // richieste senza Origin (curl, server-side) → CONSENTI
+  if (!origin) return true;
+
+  if (allowedOrigins.has(origin)) return true;
+  if (NETLIFY_PREVIEW_RE.test(origin)) return true;
+  if (NETLIFY_PROD_RE.test(origin)) return true;
+
+  return false;
+}
+
+const corsOptions: cors.CorsOptions = {
+  origin: (origin, cb) => {
+    // IMPORTANTISSIMO: non fare throw / non passare Error, altrimenti ti genera 500
+    cb(null, isAllowedOrigin(origin));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 204,
+};
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const resetLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const searchLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+app.use(cors(corsOptions));
+// Preflight esplicito (sicuro)
+app.options("*", cors(corsOptions));
 
 app.use(express.json({ limit: "10mb" }));
 
-/** ===== Uploads (avatar + immagini chat) ===== */
-const UPLOADS_DIR = path.resolve(process.cwd(), "uploads");
+/** ===== Uploads (avatar + immagini chat) =====
+ *  Nota: per persistenza su Railway, monta un Volume su /app/uploads
+ *  oppure imposta env UPLOADS_DIR a un path persistente.
+ */
+const UPLOADS_DIR = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(process.cwd(), "uploads");
+
 const AVATAR_DIR = path.join(UPLOADS_DIR, "avatars");
 const CHAT_IMG_DIR = path.join(UPLOADS_DIR, "chat-images");
 const FILES_DIR = path.join(UPLOADS_DIR, "files");
@@ -62,7 +130,15 @@ for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR, FILES_DIR, AUDIO_DIR])
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-app.use("/uploads", express.static(UPLOADS_DIR));
+// pubblico
+app.use(
+  "/uploads",
+  express.static(UPLOADS_DIR, {
+    setHeaders(res) {
+      res.setHeader("X-Content-Type-Options", "nosniff");
+    },
+  })
+);
 
 const storage = multer.diskStorage({
   destination: (req: any, file: any, cb: any) => {
@@ -80,9 +156,44 @@ const storage = multer.diskStorage({
   },
 });
 
+const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const ALLOWED_AUDIO_MIMES = new Set(["audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4"]);
+const ALLOWED_FILE_MIMES = new Set([
+  "application/pdf",
+  "application/zip",
+  "application/x-zip-compressed",
+  "text/plain",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "application/vnd.ms-excel",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+
+function isAllowedUpload(fieldname: string, mimetype: string): boolean {
+  const f = String(fieldname || "").toLowerCase();
+  const mt = String(mimetype || "").toLowerCase();
+
+  // avatar + immagini chat
+  if (f === "avatar" || f === "image") return ALLOWED_IMAGE_MIMES.has(mt);
+
+  // vocali
+  if (f === "audio") return ALLOWED_AUDIO_MIMES.has(mt);
+
+  // allegati
+  if (f === "file") return ALLOWED_FILE_MIMES.has(mt);
+
+  // default: blocca
+  return false;
+}
+
 const upload = multer({
   storage,
   limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  fileFilter: (_req: any, file: any, cb: any) => {
+    const ok = isAllowedUpload(String(file?.fieldname || ""), String(file?.mimetype || ""));
+    if (!ok) return cb(new Error("Tipo file non consentito"));
+    return cb(null, true);
+  },
 });
 
 /** ===== Auth middleware ===== */
@@ -118,23 +229,21 @@ function safeUser(u: any, opts?: { includeEmail?: boolean }) {
 }
 
 function signToken(userId: number) {
-  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" });
+  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" } as any);
 }
 
 /** ===== Socket.IO ===== */
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: Array.from(allowedOrigins),
+    origin: (origin, cb) => cb(null, isAllowedOrigin(origin)),
     credentials: true,
+    methods: ["GET", "POST"],
   },
 });
 
 io.use((socket, next) => {
   // Il client di solito manda token in auth: { token }
-  const token =
-    (socket.handshake as any)?.auth?.token ||
-    (socket.handshake as any)?.query?.token ||
-    null;
+  const token = (socket.handshake as any)?.auth?.token || (socket.handshake as any)?.query?.token || null;
 
   if (!token) {
     (socket.data as any).userId = null;
@@ -192,7 +301,7 @@ io.on("connection", (socket) => {
       const ok = await ensureParticipant(cid, uid);
       if (!ok) return;
 
-      // ✅ include sender così NON esiste più l’errore TS message.sender
+      // include sender per evitare problemi frontend
       const msg = await prisma.message.create({
         data: {
           conversationId: cid,
@@ -206,7 +315,7 @@ io.on("connection", (socket) => {
       const payload = { ...msg, sender: safeUser((msg as any).sender) };
 
       io.to(`conv_${cid}`).emit("message:new", { conversationId: cid, message: payload });
-      io.to(`conv_${cid}`).emit("message", { conversationId: cid, message: payload }); // alias di compatibilità
+      io.to(`conv_${cid}`).emit("message", { conversationId: cid, message: payload }); // alias compat
     } catch (e) {
       console.error("SOCKET_MESSAGE_SEND_ERR", e);
     }
@@ -214,20 +323,13 @@ io.on("connection", (socket) => {
 });
 
 /** ===== Routes ===== */
+
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // AUTH
-app.post("/auth/register", async (req, res) => {
+app.post("/auth/register", authLimiter, async (req, res) => {
   try {
-    const {
-      email,
-      password,
-      username,
-      displayName,
-      city = null,
-      area = null,
-      termsAccepted,
-    } = req.body || {};
+    const { email, password, username, displayName, city = null, area = null, termsAccepted } = req.body || {};
 
     if (!email || !password || !username || !displayName) {
       return res.status(400).json({ error: "Campi mancanti" });
@@ -268,7 +370,7 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", authLimiter, async (req, res) => {
   try {
     const { emailOrUsername, password } = req.body || {};
     if (!emailOrUsername || !password) return res.status(400).json({ error: "Campi mancanti" });
@@ -294,6 +396,168 @@ app.post("/auth/login", async (req, res) => {
   } catch (e) {
     console.error("LOGIN_ERR", e);
     return res.status(500).json({ error: "Errore login" });
+  }
+});
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodemailer = require("nodemailer") as any;
+
+const APP_URL = String(process.env.APP_URL || "https://claspme.com").replace(/\/+$/, "");
+const RESET_PAGE_PATH_RAW = String(process.env.RESET_PAGE_PATH || "/reset-password");
+const RESET_PAGE_PATH = RESET_PAGE_PATH_RAW.startsWith("/") ? RESET_PAGE_PATH_RAW : `/${RESET_PAGE_PATH_RAW}`;
+
+function smtpConfigured(): boolean {
+  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+function buildResetLink(token: string): string {
+  return `${APP_URL}${RESET_PAGE_PATH}?token=${encodeURIComponent(token)}`;
+}
+
+async function sendResetEmail(to: string, link: string) {
+  if (!smtpConfigured()) {
+    // Non fare throw: in prod meglio non crashare
+    console.warn("SMTP non configurato. Link reset (debug):", link);
+    return;
+  }
+
+  const host = String(process.env.SMTP_HOST);
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = String(process.env.SMTP_USER);
+  const pass = String(process.env.SMTP_PASS);
+  const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
+
+  const secure = port === 465; // 465=SSL, 587=STARTTLS
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+    // STARTTLS su 587
+    requireTLS: !secure,
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 20_000,
+  });
+
+  const subject = "Reimposta la password - CLASP";
+  const text =
+    `Hai richiesto il reset della password.\n\n` +
+    `Apri questo link:\n${link}\n\n` +
+    `Se non sei stato tu, ignora questa email.`;
+  const html = `
+    <p>Hai richiesto il reset della password.</p>
+    <p><a href="${link}">Clicca qui per reimpostare la password</a></p>
+    <p>Se non sei stato tu, ignora questa email.</p>
+  `;
+
+  await transporter.sendMail({ from, to, subject, text, html });
+}
+
+// ===== AUTH: Password reset request (DB token) =====
+// Risponde sempre {ok:true} per non rivelare se l'email esiste.
+app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+
+  // Risposta immediata (non rivela se l’email esiste)
+  res.json({ ok: true });
+
+  setImmediate(async () => {
+    try {
+      if (!email) return;
+
+      const user = await prisma.user.findUnique({ where: { email } } as any);
+      if (!user) return;
+
+      // Mantieni un solo token attivo per utente
+      try {
+        await prisma.passwordResetToken.deleteMany({ where: { userId: user.id } } as any);
+      } catch (e) {
+        console.error("PASSWORD_RESET_DELETE_OLD_ERR", e);
+      }
+
+      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
+
+      // Token random (non usare globalThis.crypto: su TS punta al WebCrypto, senza randomBytes)
+      let token: string | null = null;
+
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const candidate = nodeCrypto.randomBytes(32).toString("hex");
+        try {
+          await prisma.passwordResetToken.create({
+            data: { userId: user.id, token: candidate, expiresAt } as any,
+          } as any);
+          token = candidate;
+          break;
+        } catch (err: any) {
+          // Retry solo se collisione token (rare). Altrimenti log e stop.
+          const msg = String(err?.message || "");
+          if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("constraint")) {
+            continue;
+          }
+          console.error("PASSWORD_RESET_DB_CREATE_ERR", err);
+          return;
+        }
+      }
+
+      if (!token) {
+        console.error("PASSWORD_RESET_TOKEN_ERR", "Failed to generate unique token");
+        return;
+      }
+
+      const link = buildResetLink(token);
+
+      try {
+        await sendResetEmail(email, link);
+      } catch (mailErr) {
+        console.error("PASSWORD_RESET_EMAIL_ERR", mailErr);
+      }
+    } catch (err) {
+      console.error("PASSWORD_RESET_BG_ERR", err);
+    }
+  });
+});
+
+// ===== AUTH: Password reset confirm (DB token) =====
+app.post("/auth/password-reset/confirm", resetLimiter, async (req, res) => {
+  try {
+    const token = String(req.body?.token || "").trim();
+    const newPassword = String(req.body?.newPassword || "");
+
+    if (!token) return res.status(400).json({ error: "Token mancante" });
+    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: "Password troppo corta" });
+
+    const rec = await prisma.passwordResetToken.findUnique({
+      where: { token } as any,
+    } as any);
+
+    if (!rec) {
+      return res.status(400).json({ error: "Token non valido o scaduto" });
+    }
+
+    const exp = rec.expiresAt ? new Date(rec.expiresAt).getTime() : 0;
+    if (!exp || exp < Date.now()) {
+      // token scaduto: pulizia
+      try {
+        await prisma.passwordResetToken.deleteMany({ where: { token } } as any);
+      } catch {}
+      return res.status(400).json({ error: "Token non valido o scaduto" });
+    }
+
+    const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+
+    await prisma.user.update({
+      where: { id: rec.userId } as any,
+      data: { passwordHash } as any,
+    } as any);
+
+    // Invalida tutti i token dell'utente (one-time)
+    await prisma.passwordResetToken.deleteMany({ where: { userId: rec.userId } } as any);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("PASSWORD_RESET_CONFIRM_ERR", e);
+    return res.status(500).json({ error: "Errore reset password" });
   }
 });
 
@@ -387,7 +651,7 @@ app.post("/upload/audio", requireAuth, upload.single("audio"), async (req: any, 
 });
 
 // Ricerca utenti (colonna ricerca)
-app.get("/users/search", requireAuth, async (req: AuthedRequest, res) => {
+app.get("/users/search", searchLimiter, requireAuth, async (req: AuthedRequest, res) => {
   try {
     const q = String(req.query.q || "").trim();
     const city = String(req.query.city || "").trim();
@@ -425,7 +689,7 @@ app.get("/users/search", requireAuth, async (req: AuthedRequest, res) => {
 // ===============================
 // COMPAT: ricerca utenti via /users?q=...
 // ===============================
-app.get("/users", requireAuth, async (req: AuthedRequest, res) => {
+app.get("/users", searchLimiter, requireAuth, async (req: AuthedRequest, res) => {
   try {
     const q = String(req.query.q || "").trim();
     const city = String(req.query.city || "").trim();
@@ -653,7 +917,7 @@ app.get("/conversations", requireAuth, async (req: AuthedRequest, res) => {
     return res.json(
       convs.map((c: any) => {
         const participants = (c.participants || []).map((p: any) => ({ ...p, user: safeUser(p.user) }));
-        const last = (c.messages && c.messages[0]) ? { ...c.messages[0], sender: safeUser(c.messages[0].sender) } : null;
+        const last = c.messages && c.messages[0] ? { ...c.messages[0], sender: safeUser(c.messages[0].sender) } : null;
         return {
           ...c,
           participants,
@@ -743,12 +1007,7 @@ app.get("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, r
         include: { sender: true } as any,
       } as any);
 
-      replyMap = Object.fromEntries(
-        replied.map((m: any) => [
-          m.id,
-          { ...m, sender: safeUser(m.sender) },
-        ])
-      );
+      replyMap = Object.fromEntries(replied.map((m: any) => [m.id, { ...m, sender: safeUser(m.sender) }]));
     }
 
     return res.json(
@@ -802,7 +1061,8 @@ app.post("/messages", requireAuth, async (req: AuthedRequest, res) => {
     const content = String(req.body?.content || req.body?.text || req.body?.message || "").trim();
     const replyToId = req.body?.replyToId == null ? null : Number(req.body.replyToId);
 
-    if (!conversationId || Number.isNaN(conversationId)) return res.status(400).json({ error: "conversationId non valido" });
+    if (!conversationId || Number.isNaN(conversationId))
+      return res.status(400).json({ error: "conversationId non valido" });
     if (!content) return res.status(400).json({ error: "Messaggio vuoto" });
 
     const ok = await prisma.conversationParticipant.findFirst({
@@ -844,7 +1104,10 @@ app.patch("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
     } as any);
 
     const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${(msg as any).conversationId}`).emit("message:updated", { conversationId: (msg as any).conversationId, message: payload });
+    io.to(`conv_${(msg as any).conversationId}`).emit("message:updated", {
+      conversationId: (msg as any).conversationId,
+      message: payload,
+    });
 
     return res.json(payload);
   } catch (e) {
@@ -870,7 +1133,10 @@ app.delete("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
     } as any);
 
     const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${(msg as any).conversationId}`).emit("message:deleted", { conversationId: (msg as any).conversationId, message: payload });
+    io.to(`conv_${(msg as any).conversationId}`).emit("message:deleted", {
+      conversationId: (msg as any).conversationId,
+      message: payload,
+    });
 
     return res.json(payload);
   } catch (e) {
@@ -890,11 +1156,13 @@ app.delete("/conversations/:id", requireAuth, async (req: AuthedRequest, res) =>
     } as any);
     if (!ok) return res.status(403).json({ error: "Non autorizzato" });
 
-    await prisma.$transaction([
-      prisma.message.deleteMany({ where: { conversationId } } as any),
-      prisma.conversationParticipant.deleteMany({ where: { conversationId } } as any),
-      prisma.conversation.delete({ where: { id: conversationId } } as any),
-    ] as any);
+    await prisma.$transaction(
+      [
+        prisma.message.deleteMany({ where: { conversationId } } as any),
+        prisma.conversationParticipant.deleteMany({ where: { conversationId } } as any),
+        prisma.conversation.delete({ where: { id: conversationId } } as any),
+      ] as any
+    );
 
     return res.json({ ok: true });
   } catch (e) {
