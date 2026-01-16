@@ -16,5 +16,6 @@ RUN npm run build && npx prisma generate
 
 EXPOSE 4000
 
-CMD sh -c "npx prisma migrate deploy && node dist/server.js"
+CMD sh -c "npx prisma migrate resolve --applied 20260115221447_init || true; npx prisma migrate deploy; node dist/server.js"
+
 
