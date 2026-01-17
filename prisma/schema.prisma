@@ -31,11 +31,13 @@ model User {
   // Relations
   messages                 Message[]
   conversationParticipants ConversationParticipant[]
-  friendsA                 Friend[]                  @relation("FriendA")
-  friendsB                 Friend[]                  @relation("FriendB")
-  friendRequestsSent       FriendRequest[]           @relation("FriendRequestSent")
-  friendRequestsReceived   FriendRequest[]           @relation("FriendRequestReceived")
-  passwordResetTokens      PasswordResetToken[]
+  friendsA                 Friend[]        @relation("FriendA")
+  friendsB                 Friend[]        @relation("FriendB")
+  friendRequestsSent       FriendRequest[] @relation("FriendRequestSent")
+  friendRequestsReceived   FriendRequest[] @relation("FriendRequestReceived")
+
+  // Password reset
+  passwordResetTokens PasswordResetToken[]
 }
 
 model Conversation {
