@@ -372,13 +372,8 @@ app.post("/auth/register", authLimiter, async (req, res) => {
 
 app.post("/auth/login", authLimiter, async (req, res) => {
   try {
-    const body = req.body || {};
-    const emailOrUsername = body.emailOrUsername || body.email || body.username;
-    const password = body.password;
-
-    if (!emailOrUsername || !password) {
-      return res.status(400).json({ error: "Campi mancanti" });
-    }
+    const { emailOrUsername, password } = req.body || {};
+    if (!emailOrUsername || !password) return res.status(400).json({ error: "Campi mancanti" });
 
     const user = await prisma.user.findFirst({
       where: { OR: [{ email: emailOrUsername }, { username: emailOrUsername }] },
