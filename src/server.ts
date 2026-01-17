@@ -4,9 +4,10 @@ import http from "http";
 import cors from "cors";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import type { Secret, SignOptions } from "jsonwebtoken";
+import { randomBytes } from "crypto";
 import path from "path";
 import fs from "fs";
-import * as nodeCrypto from "crypto";
 import { PrismaClient } from "@prisma/client";
 import { Server as SocketIOServer } from "socket.io";
 import rateLimit from "express-rate-limit";
@@ -18,15 +19,6 @@ const multer = require("multer") as any;
 const prisma = new PrismaClient();
 
 const app = express();
-console.log("BOOT_MARKER dfeb9f9");
-app.get("/__version", (_req, res) => {
-  res.json({
-    service: "clasp-backend",
-    time: new Date().toISOString(),
-    commit: process.env.RAILWAY_GIT_COMMIT_SHA || process.env.GIT_COMMIT || null,
-  });
-});
-
 const httpServer = http.createServer(app);
 
 app.set("trust proxy", 1);
@@ -107,6 +99,8 @@ const searchLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+
+
 app.use(cors(corsOptions));
 // Preflight esplicito (sicuro)
 app.options("*", cors(corsOptions));
@@ -131,14 +125,11 @@ for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR, FILES_DIR, AUDIO_DIR])
 }
 
 // pubblico
-app.use(
-  "/uploads",
-  express.static(UPLOADS_DIR, {
-    setHeaders(res) {
-      res.setHeader("X-Content-Type-Options", "nosniff");
-    },
-  })
-);
+app.use("/uploads", express.static(UPLOADS_DIR, {
+  setHeaders(res) {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+  },
+}));
 
 const storage = multer.diskStorage({
   destination: (req: any, file: any, cb: any) => {
@@ -156,7 +147,7 @@ const storage = multer.diskStorage({
   },
 });
 
-const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/jpg", "image/pjpeg", "image/png", "image/webp", "image/gif"]);
 const ALLOWED_AUDIO_MIMES = new Set(["audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4"]);
 const ALLOWED_FILE_MIMES = new Set([
   "application/pdf",
@@ -210,7 +201,7 @@ function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   if (!token) return res.status(401).json({ error: "Token mancante" });
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as any;
+    const decoded = jwt.verify(token, JWT_SECRET as Secret) as any;
     const userId = Number(decoded?.userId);
     if (!userId) return res.status(401).json({ error: "Token non valido" });
     req.userId = userId;
@@ -229,7 +220,7 @@ function safeUser(u: any, opts?: { includeEmail?: boolean }) {
 }
 
 function signToken(userId: number) {
-  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "30d" } as any);
+  return jwt.sign({ userId }, JWT_SECRET as Secret, { expiresIn: "30d" } as SignOptions);
 }
 
 /** ===== Socket.IO ===== */
@@ -243,7 +234,10 @@ const io = new SocketIOServer(httpServer, {
 
 io.use((socket, next) => {
   // Il client di solito manda token in auth: { token }
-  const token = (socket.handshake as any)?.auth?.token || (socket.handshake as any)?.query?.token || null;
+  const token =
+    (socket.handshake as any)?.auth?.token ||
+    (socket.handshake as any)?.query?.token ||
+    null;
 
   if (!token) {
     (socket.data as any).userId = null;
@@ -251,7 +245,7 @@ io.use((socket, next) => {
   }
 
   try {
-    const decoded = jwt.verify(String(token), JWT_SECRET) as any;
+    const decoded = jwt.verify(String(token), JWT_SECRET as Secret) as any;
     (socket.data as any).userId = Number(decoded?.userId) || null;
   } catch {
     (socket.data as any).userId = null;
@@ -329,7 +323,15 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 // AUTH
 app.post("/auth/register", authLimiter, async (req, res) => {
   try {
-    const { email, password, username, displayName, city = null, area = null, termsAccepted } = req.body || {};
+    const {
+      email,
+      password,
+      username,
+      displayName,
+      city = null,
+      area = null,
+      termsAccepted,
+    } = req.body || {};
 
     if (!email || !password || !username || !displayName) {
       return res.status(400).json({ error: "Campi mancanti" });
@@ -398,26 +400,32 @@ app.post("/auth/login", authLimiter, async (req, res) => {
     return res.status(500).json({ error: "Errore login" });
   }
 });
+let nodemailer: any = null;
+try {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  nodemailer = require("nodemailer");
+} catch {
+  // Se nodemailer non è installato, non far crashare l'app.
+  // (Le email di reset password saranno disabilitate finché non installi la dipendenza.)
+  nodemailer = null;
+}
 
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const nodemailer = require("nodemailer") as any;
-
+const RESET_TOKEN_TTL_MINUTES = Number(process.env.RESET_TOKEN_TTL_MINUTES || "30");
+const RESET_PASSWORD_PATH = String(process.env.RESET_PASSWORD_PATH || "/reset-password");
 const APP_URL = String(process.env.APP_URL || "https://claspme.com").replace(/\/+$/, "");
-const RESET_PAGE_PATH_RAW = String(process.env.RESET_PAGE_PATH || "/reset-password");
-const RESET_PAGE_PATH = RESET_PAGE_PATH_RAW.startsWith("/") ? RESET_PAGE_PATH_RAW : `/${RESET_PAGE_PATH_RAW}`;
 
 function smtpConfigured(): boolean {
   return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
 }
 
-function buildResetLink(token: string): string {
-  return `${APP_URL}${RESET_PAGE_PATH}?token=${encodeURIComponent(token)}`;
-}
-
 async function sendResetEmail(to: string, link: string) {
   if (!smtpConfigured()) {
-    // Non fare throw: in prod meglio non crashare
     console.warn("SMTP non configurato. Link reset (debug):", link);
+    return;
+  }
+
+  if (!nodemailer) {
+    console.warn("nodemailer non installato. Link reset (debug):", link);
     return;
   }
 
@@ -433,18 +441,12 @@ async function sendResetEmail(to: string, link: string) {
     port,
     secure,
     auth: { user, pass },
-    // STARTTLS su 587
+    // IONOS su 587 richiede TLS/STARTTLS
     requireTLS: !secure,
-    connectionTimeout: 20_000,
-    greetingTimeout: 20_000,
-    socketTimeout: 20_000,
   });
 
   const subject = "Reimposta la password - CLASP";
-  const text =
-    `Hai richiesto il reset della password.\n\n` +
-    `Apri questo link:\n${link}\n\n` +
-    `Se non sei stato tu, ignora questa email.`;
+  const text = `Hai richiesto il reset della password.\n\nApri questo link:\n${link}\n\nSe non sei stato tu, ignora questa email.`;
   const html = `
     <p>Hai richiesto il reset della password.</p>
     <p><a href="${link}">Clicca qui per reimpostare la password</a></p>
@@ -454,14 +456,14 @@ async function sendResetEmail(to: string, link: string) {
   await transporter.sendMail({ from, to, subject, text, html });
 }
 
-// ===== AUTH: Password reset request (DB token) =====
-// Risponde sempre {ok:true} per non rivelare se l'email esiste.
+// ===== AUTH: Password reset request =====
 app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
 
   // Risposta immediata (non rivela se l’email esiste)
   res.json({ ok: true });
 
+  // Esegui in background per non far aspettare l'utente
   setImmediate(async () => {
     try {
       if (!email) return;
@@ -469,90 +471,66 @@ app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
       const user = await prisma.user.findUnique({ where: { email } } as any);
       if (!user) return;
 
-      // Mantieni un solo token attivo per utente
+      // Invalida eventuali token precedenti
       try {
         await prisma.passwordResetToken.deleteMany({ where: { userId: user.id } } as any);
-      } catch (e) {
-        console.error("PASSWORD_RESET_DELETE_OLD_ERR", e);
-      }
+      } catch {}
 
-      const expiresAt = new Date(Date.now() + 30 * 60 * 1000); // 30 min
+      const token = randomBytes(32).toString("hex");
+      const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MINUTES * 60 * 1000);
 
-      // Token random (non usare globalThis.crypto: su TS punta al WebCrypto, senza randomBytes)
-      let token: string | null = null;
+      await prisma.passwordResetToken.create({
+        data: { userId: user.id, token, expiresAt } as any,
+      } as any);
 
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const candidate = nodeCrypto.randomBytes(32).toString("hex");
-        try {
-          await prisma.passwordResetToken.create({
-            data: { userId: user.id, token: candidate, expiresAt } as any,
-          } as any);
-          token = candidate;
-          break;
-        } catch (err: any) {
-          // Retry solo se collisione token (rare). Altrimenti log e stop.
-          const msg = String(err?.message || "");
-          if (msg.toLowerCase().includes("unique") || msg.toLowerCase().includes("constraint")) {
-            continue;
-          }
-          console.error("PASSWORD_RESET_DB_CREATE_ERR", err);
-          return;
-        }
-      }
+      const base = APP_URL.replace(/\/+$/, "");
+      const p = RESET_PASSWORD_PATH.startsWith("/") ? RESET_PASSWORD_PATH : `/${RESET_PASSWORD_PATH}`;
+      const link = `${base}${p}?token=${encodeURIComponent(token)}`;
 
-      if (!token) {
-        console.error("PASSWORD_RESET_TOKEN_ERR", "Failed to generate unique token");
-        return;
-      }
-
-      const link = buildResetLink(token);
-
-      try {
-        await sendResetEmail(email, link);
-      } catch (mailErr) {
-        console.error("PASSWORD_RESET_EMAIL_ERR", mailErr);
-      }
+      await sendResetEmail(email, link);
     } catch (err) {
       console.error("PASSWORD_RESET_BG_ERR", err);
     }
   });
 });
 
-// ===== AUTH: Password reset confirm (DB token) =====
+// ===== AUTH: Password reset confirm =====
 app.post("/auth/password-reset/confirm", resetLimiter, async (req, res) => {
   try {
     const token = String(req.body?.token || "").trim();
     const newPassword = String(req.body?.newPassword || "");
 
     if (!token) return res.status(400).json({ error: "Token mancante" });
-    if (!newPassword || newPassword.length < 6) return res.status(400).json({ error: "Password troppo corta" });
-
-    const rec = await prisma.passwordResetToken.findUnique({
-      where: { token } as any,
-    } as any);
-
-    if (!rec) {
-      return res.status(400).json({ error: "Token non valido o scaduto" });
+    if (!newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: "Password troppo corta" });
     }
 
-    const exp = rec.expiresAt ? new Date(rec.expiresAt).getTime() : 0;
-    if (!exp || exp < Date.now()) {
-      // token scaduto: pulizia
+    const rec = await prisma.passwordResetToken.findFirst({
+      where: { token },
+    } as any);
+
+    if (!rec) return res.status(400).json({ error: "Token non valido o scaduto" });
+
+    const exp = (rec as any).expiresAt ? new Date((rec as any).expiresAt).getTime() : 0;
+    if (exp && exp < Date.now()) {
       try {
         await prisma.passwordResetToken.deleteMany({ where: { token } } as any);
       } catch {}
       return res.status(400).json({ error: "Token non valido o scaduto" });
     }
 
+    const userId = Number((rec as any).userId);
+    if (!userId) return res.status(400).json({ error: "Token non valido" });
+
     const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
 
-    await prisma.user.update({
-      where: { id: rec.userId } as any,
-      data: { passwordHash } as any,
-    } as any);
-
-    // Invalida tutti i token dell'utente (one-time)
-    await prisma.passwordResetToken.deleteMany({ where: { userId: rec.userId } } as any);
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: userId },
+        data: { passwordHash } as any,
+      } as any),
+      prisma.passwordResetToken.deleteMany({ where: { userId } } as any),
+    ] as any);
 
     return res.json({ ok: true });
   } catch (e) {
@@ -560,6 +538,7 @@ app.post("/auth/password-reset/confirm", resetLimiter, async (req, res) => {
     return res.status(500).json({ error: "Errore reset password" });
   }
 });
+
 
 app.get("/me", requireAuth, async (req: AuthedRequest, res) => {
   try {
@@ -917,7 +896,7 @@ app.get("/conversations", requireAuth, async (req: AuthedRequest, res) => {
     return res.json(
       convs.map((c: any) => {
         const participants = (c.participants || []).map((p: any) => ({ ...p, user: safeUser(p.user) }));
-        const last = c.messages && c.messages[0] ? { ...c.messages[0], sender: safeUser(c.messages[0].sender) } : null;
+        const last = (c.messages && c.messages[0]) ? { ...c.messages[0], sender: safeUser(c.messages[0].sender) } : null;
         return {
           ...c,
           participants,
@@ -1007,7 +986,12 @@ app.get("/conversations/:id/messages", requireAuth, async (req: AuthedRequest, r
         include: { sender: true } as any,
       } as any);
 
-      replyMap = Object.fromEntries(replied.map((m: any) => [m.id, { ...m, sender: safeUser(m.sender) }]));
+      replyMap = Object.fromEntries(
+        replied.map((m: any) => [
+          m.id,
+          { ...m, sender: safeUser(m.sender) },
+        ])
+      );
     }
 
     return res.json(
@@ -1061,8 +1045,7 @@ app.post("/messages", requireAuth, async (req: AuthedRequest, res) => {
     const content = String(req.body?.content || req.body?.text || req.body?.message || "").trim();
     const replyToId = req.body?.replyToId == null ? null : Number(req.body.replyToId);
 
-    if (!conversationId || Number.isNaN(conversationId))
-      return res.status(400).json({ error: "conversationId non valido" });
+    if (!conversationId || Number.isNaN(conversationId)) return res.status(400).json({ error: "conversationId non valido" });
     if (!content) return res.status(400).json({ error: "Messaggio vuoto" });
 
     const ok = await prisma.conversationParticipant.findFirst({
@@ -1104,10 +1087,7 @@ app.patch("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
     } as any);
 
     const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${(msg as any).conversationId}`).emit("message:updated", {
-      conversationId: (msg as any).conversationId,
-      message: payload,
-    });
+    io.to(`conv_${(msg as any).conversationId}`).emit("message:updated", { conversationId: (msg as any).conversationId, message: payload });
 
     return res.json(payload);
   } catch (e) {
@@ -1133,10 +1113,7 @@ app.delete("/messages/:id", requireAuth, async (req: AuthedRequest, res) => {
     } as any);
 
     const payload = { ...msg, sender: safeUser((msg as any).sender) };
-    io.to(`conv_${(msg as any).conversationId}`).emit("message:deleted", {
-      conversationId: (msg as any).conversationId,
-      message: payload,
-    });
+    io.to(`conv_${(msg as any).conversationId}`).emit("message:deleted", { conversationId: (msg as any).conversationId, message: payload });
 
     return res.json(payload);
   } catch (e) {
@@ -1156,13 +1133,11 @@ app.delete("/conversations/:id", requireAuth, async (req: AuthedRequest, res) =>
     } as any);
     if (!ok) return res.status(403).json({ error: "Non autorizzato" });
 
-    await prisma.$transaction(
-      [
-        prisma.message.deleteMany({ where: { conversationId } } as any),
-        prisma.conversationParticipant.deleteMany({ where: { conversationId } } as any),
-        prisma.conversation.delete({ where: { id: conversationId } } as any),
-      ] as any
-    );
+    await prisma.$transaction([
+      prisma.message.deleteMany({ where: { conversationId } } as any),
+      prisma.conversationParticipant.deleteMany({ where: { conversationId } } as any),
+      prisma.conversation.delete({ where: { id: conversationId } } as any),
+    ] as any);
 
     return res.json({ ok: true });
   } catch (e) {
@@ -1174,6 +1149,12 @@ app.delete("/conversations/:id", requireAuth, async (req: AuthedRequest, res) =>
 /** ===== Error handling ===== */
 app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   console.error("UNHANDLED_ERR", err);
+
+  // body-parser JSON errors
+  if (err?.type === "entity.parse.failed" || err?.status === 400) {
+    return res.status(400).json({ error: "JSON non valido" });
+  }
+
   return res.status(500).json({ error: "Errore server" });
 });
 
