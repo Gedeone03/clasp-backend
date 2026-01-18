@@ -1,4 +1,3 @@
--- Create table if missing
 CREATE TABLE IF NOT EXISTS "PasswordResetToken" (
   "id" SERIAL PRIMARY KEY,
   "userId" INTEGER NOT NULL,
@@ -23,7 +22,6 @@ BEGIN
   END IF;
 END $$;
 
--- Fix Prisma failed migration (P3009)
 UPDATE "_prisma_migrations"
 SET finished_at = NOW(),
     logs = NULL,
