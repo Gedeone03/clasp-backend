@@ -16,7 +16,8 @@ RUN npm run build && npx prisma generate
 
 EXPOSE 4000
 
-CMD ["sh","-c","set -e; MIG=$(ls -1 prisma/migrations 2>/dev/null | grep -v migration_lock | head -n 1 || true); echo \"[boot] migration=$MIG\"; if [ -n \"$MIG\" ]; then echo \"[prisma] baseline $MIG\"; npx prisma migrate resolve --applied \"$MIG\" || true; fi; echo \"[prisma] migrate deploy\"; npx prisma migrate deploy; echo \"[node] start\"; node dist/server.js"]
+CMD sh -c "npx prisma db execute --schema prisma/schema.prisma --file prisma_repair.sql || true; npx prisma migrate deploy; node dist/server.js"
+
 
 
 
