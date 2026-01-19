@@ -461,6 +461,53 @@ async function sendPasswordResetEmail(to: string, link: string) {
 
   await transporter.sendMail({ from, to, subject, text, html });
 }
+// ===== Password reset helpers =====
+function buildResetLink(token: string) {
+  const base = String(process.env.APP_URL || "https://claspme.com").replace(/\/+$/, "");
+  const path = String(process.env.RESET_PAGE_PATH || "/reset-password");
+  const p = path.startsWith("/") ? path : `/${path}`;
+  return `${base}${p}?token=${encodeURIComponent(token)}`;
+}
+
+async function sendResetEmail(to: string, link: string) {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const nodemailer = require("nodemailer");
+
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+
+  if (!host || !user || !pass) {
+    console.warn("[PWD_RESET] SMTP not configured. Link:", link);
+    return;
+  }
+
+  const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
+  const secure = port === 465;
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+    requireTLS: !secure,
+    tls: { minVersion: "TLSv1.2" },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+  });
+
+  await transporter.sendMail({
+    from,
+    to,
+    subject: "Reimposta la password - CLASP",
+    text:
+      `Hai richiesto il reset della password.\n\n` +
+      `Apri questo link:\n${link}\n\n` +
+      `Se non sei stato tu, ignora questa email.`,
+  });
+}
 
 // ===== AUTH: Password reset request =====
 // Risponde SEMPRE { ok: true } e poi invia email in background (non blocca il client)
