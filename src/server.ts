@@ -1352,3 +1352,6 @@ app.use((_req, res) => {
 httpServer.listen(PORT, () => {
   console.log(`Backend online su http://localhost:${PORT}`);
 });
+
+// DEPLOY_TRIGGER 2026-01-19T21:12:31
+
