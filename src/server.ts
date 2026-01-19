@@ -456,7 +456,7 @@ console.log("[PWD_RESET] email send attempted");
 // ===== AUTH: Password reset request =====
 // Risponde SEMPRE { ok: true } e poi invia email in background (non blocca il client)
 app.post("/auth/password-reset/request", async (req, res) => {
-console.log("[PWD_RESET] request received", req.body);
+  console.log("[PWD_RESET] request received", req.body);
 
   const email = String(req.body?.email || "").trim().toLowerCase();
 
@@ -468,14 +468,12 @@ console.log("[PWD_RESET] request received", req.body);
       if (!email) return;
 
       const user = await prisma.user.findUnique({ where: { email } } as any);
-if (!user) {
-  console.log("[PWD_RESET] user NOT found", email);
-  return;
-}
+      if (!user) {
+        console.log("[PWD_RESET] user NOT found", email);
+        return;
+      }
 
-console.log("[PWD_RESET] user FOUND", user.id);
-
-      if (!user) return;
+      console.log("[PWD_RESET] user FOUND", user.id);
 
       // Firma legata alla password attuale: se la password cambia, il token vecchio diventa invalido
       const sig = String((user as any).passwordHash || "").slice(0, 12);
@@ -486,16 +484,19 @@ console.log("[PWD_RESET] user FOUND", user.id);
         { expiresIn: RESET_JWT_EXPIRES } as any
       );
 
+      // Se hai buildResetLink(token), puoi usare quello. Altrimenti questa va benissimo.
       const link = `${APP_URL}/reset-password?token=${encodeURIComponent(token)}`;
 
-      await sendPasswordResetEmail(email, link);
-      console.log("[PWD_RESET] email inviata (o tentata) a:", email);
+      console.log("[PWD_RESET] sending email", { host: process.env.SMTP_HOST, port: process.env.SMTP_PORT });
+
+      await sendResetEmail(email, link);
+
+      console.log("[PWD_RESET] email sent/attempted", email);
     } catch (e) {
       console.error("[PWD_RESET] errore invio:", e);
     }
   });
 });
-
 // ===== AUTH: Password reset confirm =====
 app.post("/auth/password-reset/confirm", async (req, res) => {
   try {
@@ -583,7 +584,57 @@ app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
           return;
         }
       }
+// ===== Password reset helpers =====
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodemailer = require("nodemailer") as any;
 
+const APP_URL = String(process.env.APP_URL || "https://claspme.com").replace(/\/+$/, "");
+const RESET_PAGE_PATH = String(process.env.RESET_PAGE_PATH || "/reset-password").startsWith("/")
+  ? String(process.env.RESET_PAGE_PATH || "/reset-password")
+  : `/${String(process.env.RESET_PAGE_PATH || "reset-password")}`;
+
+function buildResetLink(token: string) {
+  return `${APP_URL}${RESET_PAGE_PATH}?token=${encodeURIComponent(token)}`;
+}
+
+function smtpConfigured(): boolean {
+  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+async function sendResetEmail(to: string, link: string) {
+  if (!smtpConfigured()) {
+    console.warn("[PWD_RESET] SMTP not configured. Link:", link);
+    return;
+  }
+
+  const host = String(process.env.SMTP_HOST);
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = String(process.env.SMTP_USER);
+  const pass = String(process.env.SMTP_PASS);
+  const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
+
+  const secure = port === 465;
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+    requireTLS: !secure,
+    tls: { minVersion: "TLSv1.2" },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+  });
+
+  const subject = "Reimposta la password - CLASP";
+  const text =
+    `Hai richiesto il reset della password.\n\n` +
+    `Apri questo link:\n${link}\n\n` +
+    `Se non sei stato tu, ignora questa email.`;
+
+  await transporter.sendMail({ from, to, subject, text });
+}
       if (!token) {
         console.error("PASSWORD_RESET_TOKEN_ERR", "Failed to generate unique token");
         return;
