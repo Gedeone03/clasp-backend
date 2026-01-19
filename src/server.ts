@@ -538,6 +538,48 @@ app.post("/auth/password-reset/confirm", async (req, res) => {
     return res.status(500).json({ error: "Errore reset password" });
   }
 });
+// ===== Password reset email (SMTP) =====
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodemailer = require("nodemailer") as any;
+
+function smtpConfigured(): boolean {
+  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
+}
+
+async function sendResetEmail(to: string, link: string) {
+  if (!smtpConfigured()) {
+    console.warn("[PWD_RESET] SMTP not configured. Link:", link);
+    return;
+  }
+
+  const host = String(process.env.SMTP_HOST);
+  const port = Number(process.env.SMTP_PORT || "587");
+  const user = String(process.env.SMTP_USER);
+  const pass = String(process.env.SMTP_PASS);
+  const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
+
+  const secure = port === 465;
+
+  const transporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: { user, pass },
+    requireTLS: !secure,
+    tls: { minVersion: "TLSv1.2" },
+    connectionTimeout: 15000,
+    greetingTimeout: 15000,
+    socketTimeout: 20000,
+  });
+
+  const subject = "Reimposta la password - CLASP";
+  const text =
+    `Hai richiesto il reset della password.\n\n` +
+    `Apri questo link:\n${link}\n\n` +
+    `Se non sei stato tu, ignora questa email.`;
+
+  await transporter.sendMail({ from, to, subject, text });
+}
 
 // ===== AUTH: Password reset request (DB token) =====
 // Risponde sempre {ok:true} per non rivelare se l'email esiste.
