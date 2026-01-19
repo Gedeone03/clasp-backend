@@ -14,6 +14,8 @@ import rateLimit from "express-rate-limit";
 // Multer: uso require per evitare problemi di typings in build
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const multer = require("multer") as any;
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const sharp = require("sharp") as any;
 
 const prisma = new PrismaClient();
 
@@ -125,8 +127,9 @@ const AVATAR_DIR = path.join(UPLOADS_DIR, "avatars");
 const CHAT_IMG_DIR = path.join(UPLOADS_DIR, "chat-images");
 const FILES_DIR = path.join(UPLOADS_DIR, "files");
 const AUDIO_DIR = path.join(UPLOADS_DIR, "audio");
+const VIDEO_DIR = path.join(UPLOADS_DIR, "videos");
 
-for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR, FILES_DIR, AUDIO_DIR]) {
+for (const dir of [UPLOADS_DIR, AVATAR_DIR, CHAT_IMG_DIR, FILES_DIR, AUDIO_DIR, VIDEO_DIR]) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
@@ -146,6 +149,7 @@ const storage = multer.diskStorage({
     if (field === "avatar") return cb(null, AVATAR_DIR);
     if (field === "audio") return cb(null, AUDIO_DIR);
     if (field === "file") return cb(null, FILES_DIR);
+    if (field === "video") return cb(null, VIDEO_DIR);
     // default: immagini chat
     return cb(null, CHAT_IMG_DIR);
   },
@@ -156,7 +160,7 @@ const storage = multer.diskStorage({
   },
 });
 
-const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
+const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg", "image/pjpeg", "image/heic", "image/heif"]);
 const ALLOWED_AUDIO_MIMES = new Set(["audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4"]);
 const ALLOWED_FILE_MIMES = new Set([
   "application/pdf",
@@ -167,6 +171,13 @@ const ALLOWED_FILE_MIMES = new Set([
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/vnd.ms-excel",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+]);
+
+const ALLOWED_VIDEO_MIMES = new Set([
+  "video/mp4",
+  "video/webm",
+  "video/quicktime",
+  "video/x-m4v",
 ]);
 
 function isAllowedUpload(fieldname: string, mimetype: string): boolean {
@@ -182,13 +193,16 @@ function isAllowedUpload(fieldname: string, mimetype: string): boolean {
   // allegati
   if (f === "file") return ALLOWED_FILE_MIMES.has(mt);
 
+  // video
+  if (f === "video") return ALLOWED_VIDEO_MIMES.has(mt);
+
   // default: blocca
   return false;
 }
 
 const upload = multer({
   storage,
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
   fileFilter: (_req: any, file: any, cb: any) => {
     const ok = isAllowedUpload(String(file?.fieldname || ""), String(file?.mimetype || ""));
     if (!ok) return cb(new Error("Tipo file non consentito"));
@@ -401,7 +415,7 @@ app.post("/auth/login", authLimiter, async (req, res) => {
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-;
+const nodemailer = require("nodemailer");
 
 const RESET_JWT_SECRET = process.env.RESET_JWT_SECRET || `${JWT_SECRET}__reset`;
 const RESET_JWT_EXPIRES = process.env.RESET_JWT_EXPIRES || "30m"; // 30 minuti
@@ -444,20 +458,13 @@ async function sendPasswordResetEmail(to: string, link: string) {
     <p><a href="${link}">Clicca qui per reimpostare la password</a></p>
     <p>Se non sei stato tu, ignora questa email.</p>
   `;
-console.log("[PWD_RESET] sending email via SMTP", {
-  host: process.env.SMTP_HOST,
-  port: process.env.SMTP_PORT,
-});
 
   await transporter.sendMail({ from, to, subject, text, html });
 }
-console.log("[PWD_RESET] email send attempted");
 
 // ===== AUTH: Password reset request =====
 // Risponde SEMPRE { ok: true } e poi invia email in background (non blocca il client)
 app.post("/auth/password-reset/request", async (req, res) => {
-  console.log("[PWD_RESET] request received", req.body);
-
   const email = String(req.body?.email || "").trim().toLowerCase();
 
   // Non rivelare se l'email esiste: rispondi subito
@@ -468,12 +475,7 @@ app.post("/auth/password-reset/request", async (req, res) => {
       if (!email) return;
 
       const user = await prisma.user.findUnique({ where: { email } } as any);
-      if (!user) {
-        console.log("[PWD_RESET] user NOT found", email);
-        return;
-      }
-
-      console.log("[PWD_RESET] user FOUND", user.id);
+      if (!user) return;
 
       // Firma legata alla password attuale: se la password cambia, il token vecchio diventa invalido
       const sig = String((user as any).passwordHash || "").slice(0, 12);
@@ -484,19 +486,16 @@ app.post("/auth/password-reset/request", async (req, res) => {
         { expiresIn: RESET_JWT_EXPIRES } as any
       );
 
-      // Se hai buildResetLink(token), puoi usare quello. Altrimenti questa va benissimo.
       const link = `${APP_URL}/reset-password?token=${encodeURIComponent(token)}`;
 
-      console.log("[PWD_RESET] sending email", { host: process.env.SMTP_HOST, port: process.env.SMTP_PORT });
-
-      await sendResetEmail(email, link);
-
-      console.log("[PWD_RESET] email sent/attempted", email);
+      await sendPasswordResetEmail(email, link);
+      console.log("[PWD_RESET] email inviata (o tentata) a:", email);
     } catch (e) {
       console.error("[PWD_RESET] errore invio:", e);
     }
   });
 });
+
 // ===== AUTH: Password reset confirm =====
 app.post("/auth/password-reset/confirm", async (req, res) => {
   try {
@@ -538,48 +537,6 @@ app.post("/auth/password-reset/confirm", async (req, res) => {
     return res.status(500).json({ error: "Errore reset password" });
   }
 });
-// ===== Password reset email (SMTP) =====
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const nodemailer = require("nodemailer") as any;
-
-function smtpConfigured(): boolean {
-  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
-}
-
-async function sendResetEmail(to: string, link: string) {
-  if (!smtpConfigured()) {
-    console.warn("[PWD_RESET] SMTP not configured. Link:", link);
-    return;
-  }
-
-  const host = String(process.env.SMTP_HOST);
-  const port = Number(process.env.SMTP_PORT || "587");
-  const user = String(process.env.SMTP_USER);
-  const pass = String(process.env.SMTP_PASS);
-  const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
-
-  const secure = port === 465;
-
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-    requireTLS: !secure,
-    tls: { minVersion: "TLSv1.2" },
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000,
-  });
-
-  const subject = "Reimposta la password - CLASP";
-  const text =
-    `Hai richiesto il reset della password.\n\n` +
-    `Apri questo link:\n${link}\n\n` +
-    `Se non sei stato tu, ignora questa email.`;
-
-  await transporter.sendMail({ from, to, subject, text });
-}
 
 // ===== AUTH: Password reset request (DB token) =====
 // Risponde sempre {ok:true} per non rivelare se l'email esiste.
@@ -626,57 +583,7 @@ app.post("/auth/password-reset/request", resetLimiter, async (req, res) => {
           return;
         }
       }
-// ===== Password reset helpers =====
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const nodemailer = require("nodemailer") as any;
 
-const APP_URL = String(process.env.APP_URL || "https://claspme.com").replace(/\/+$/, "");
-const RESET_PAGE_PATH = String(process.env.RESET_PAGE_PATH || "/reset-password").startsWith("/")
-  ? String(process.env.RESET_PAGE_PATH || "/reset-password")
-  : `/${String(process.env.RESET_PAGE_PATH || "reset-password")}`;
-
-function buildResetLink(token: string) {
-  return `${APP_URL}${RESET_PAGE_PATH}?token=${encodeURIComponent(token)}`;
-}
-
-function smtpConfigured(): boolean {
-  return !!(process.env.SMTP_HOST && process.env.SMTP_PORT && process.env.SMTP_USER && process.env.SMTP_PASS);
-}
-
-async function sendResetEmail(to: string, link: string) {
-  if (!smtpConfigured()) {
-    console.warn("[PWD_RESET] SMTP not configured. Link:", link);
-    return;
-  }
-
-  const host = String(process.env.SMTP_HOST);
-  const port = Number(process.env.SMTP_PORT || "587");
-  const user = String(process.env.SMTP_USER);
-  const pass = String(process.env.SMTP_PASS);
-  const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
-
-  const secure = port === 465;
-
-  const transporter = nodemailer.createTransport({
-    host,
-    port,
-    secure,
-    auth: { user, pass },
-    requireTLS: !secure,
-    tls: { minVersion: "TLSv1.2" },
-    connectionTimeout: 15000,
-    greetingTimeout: 15000,
-    socketTimeout: 20000,
-  });
-
-  const subject = "Reimposta la password - CLASP";
-  const text =
-    `Hai richiesto il reset della password.\n\n` +
-    `Apri questo link:\n${link}\n\n` +
-    `Se non sei stato tu, ignora questa email.`;
-
-  await transporter.sendMail({ from, to, subject, text });
-}
       if (!token) {
         console.error("PASSWORD_RESET_TOKEN_ERR", "Failed to generate unique token");
         return;
@@ -777,6 +684,31 @@ app.post("/upload/avatar", requireAuth, upload.single("avatar"), async (req: any
   try {
     if (!req.file) return res.status(400).json({ error: "File mancante" });
 
+    // Convert HEIC/HEIF avatars from iPhone to JPG so they render everywhere
+    try {
+      const original = String(req.file?.originalname || "").toLowerCase();
+      const mimetype = String(req.file?.mimetype || "").toLowerCase();
+      const isHeic =
+        original.endsWith(".heic") ||
+        original.endsWith(".heif") ||
+        mimetype === "image/heic" ||
+        mimetype === "image/heif";
+
+      if (isHeic) {
+        const inputPath = req.file.path;
+        const baseName = String(req.file.filename || "").replace(/\.[^.]+$/, "");
+        const jpgName = `${baseName}.jpg`;
+        const outputPath = path.join(path.dirname(inputPath), jpgName);
+
+        await sharp(inputPath).jpeg({ quality: 85 }).toFile(outputPath);
+        fs.unlinkSync(inputPath);
+
+        req.file.filename = jpgName;
+      }
+    } catch (convErr) {
+      console.error("AVATAR_HEIC_CONVERT_ERR", convErr);
+    }
+
     const avatarUrl = `/uploads/avatars/${req.file.filename}`;
 
     const updated = await prisma.user.update({
@@ -816,7 +748,19 @@ app.post("/upload/file", requireAuth, upload.single("file"), async (req: any, re
 });
 
 // Upload audio (vocali)
-app.post("/upload/audio", requireAuth, upload.single("audio"), async (req: any, res: any) => {
+app.post("/upload/audio", requireAuth, upload.sing
+// Upload video
+app.post("/upload/video", requireAuth, upload.single("video"), async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+    const url = `/uploads/videos/${req.file.filename}`;
+    return res.json({ ok: true, url });
+  } catch (e) {
+    console.error("UPLOAD_VIDEO_ERR", e);
+    return res.status(500).json({ error: "Errore upload video" });
+  }
+});
+le("audio"), async (req: any, res: any) => {
   try {
     if (!req.file) return res.status(400).json({ error: "File mancante" });
     const url = `/uploads/audio/${req.file.filename}`;
