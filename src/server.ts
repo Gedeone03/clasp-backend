@@ -420,7 +420,7 @@ async function sendPasswordResetEmail(to: string, link: string) {
   const host = String(process.env.SMTP_HOST);
   const port = Number(process.env.SMTP_PORT || "587");
   const user = String(process.env.SMTP_USER);
-  conconst nodemailer = require("nodemailer")st pass = String(process.env.SMTP_PASS);
+  const pass = String(process.env.SMTP_PASS);
   const from = String(process.env.SMTP_FROM || `CLASP <${user}>`);
 
   const secure = port === 465;
