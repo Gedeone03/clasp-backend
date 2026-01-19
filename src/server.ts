@@ -748,7 +748,17 @@ app.post("/upload/file", requireAuth, upload.single("file"), async (req: any, re
 });
 
 // Upload audio (vocali)
-app.post("/upload/audio", requireAuth, upload.sing
+app.post("/upload/audio", requireAuth, upload.single("audio"), async (req: any, res: any) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: "File mancante" });
+    const url = `/uploads/audio/${req.file.filename}`;
+    return res.json({ ok: true, url });
+  } catch (e) {
+    console.error("UPLOAD_AUDIO_ERR", e);
+    return res.status(500).json({ error: "Errore upload audio" });
+  }
+});
+
 // Upload video
 app.post("/upload/video", requireAuth, upload.single("video"), async (req: any, res: any) => {
   try {
@@ -758,16 +768,6 @@ app.post("/upload/video", requireAuth, upload.single("video"), async (req: any, 
   } catch (e) {
     console.error("UPLOAD_VIDEO_ERR", e);
     return res.status(500).json({ error: "Errore upload video" });
-  }
-});
-le("audio"), async (req: any, res: any) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "File mancante" });
-    const url = `/uploads/audio/${req.file.filename}`;
-    return res.json({ ok: true, url });
-  } catch (e) {
-    console.error("UPLOAD_AUDIO_ERR", e);
-    return res.status(500).json({ error: "Errore upload audio" });
   }
 });
 
