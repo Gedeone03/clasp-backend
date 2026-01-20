@@ -143,6 +143,37 @@ app.use(
   })
 );
 
+
+function extFromMime(mimetype: string): string {
+  const mt = String(mimetype || "").toLowerCase().split(";")[0].trim();
+  switch (mt) {
+    case "image/jpeg":
+    case "image/jpg":
+    case "image/pjpeg":
+      return ".jpg";
+    case "image/png":
+      return ".png";
+    case "image/webp":
+      return ".webp";
+    case "image/gif":
+      return ".gif";
+    case "image/heic":
+      return ".heic";
+    case "image/heif":
+      return ".heif";
+    case "video/mp4":
+      return ".mp4";
+    case "video/webm":
+      return ".webm";
+    case "video/quicktime":
+      return ".mov";
+    case "video/x-m4v":
+      return ".m4v";
+    default:
+      return "";
+  }
+}
+
 const storage = multer.diskStorage({
   destination: (req: any, file: any, cb: any) => {
     const field = String(file?.fieldname || "");
@@ -153,14 +184,25 @@ const storage = multer.diskStorage({
     // default: immagini chat
     return cb(null, CHAT_IMG_DIR);
   },
-  filename: (req: any, file: any, cb: any) => {
-    const ext = path.extname(file.originalname || "").slice(0, 12) || "";
+  filename: (_req: any, file: any, cb: any) => {
+    let ext = path.extname(String(file?.originalname || ""));
+    if (!ext) ext = extFromMime(String(file?.mimetype || ""));
+    ext = String(ext || "").toLowerCase().slice(0, 12);
     const safe = `${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`;
     cb(null, safe);
   },
 });
 
-const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg", "image/pjpeg", "image/heic", "image/heif"]);
+const ALLOWED_IMAGE_MIMES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/jpg",
+  "image/pjpeg",
+  "image/heic",
+  "image/heif",
+]);
 const ALLOWED_AUDIO_MIMES = new Set(["audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4"]);
 const ALLOWED_FILE_MIMES = new Set([
   "application/pdf",
@@ -182,7 +224,7 @@ const ALLOWED_VIDEO_MIMES = new Set([
 
 function isAllowedUpload(fieldname: string, mimetype: string): boolean {
   const f = String(fieldname || "").toLowerCase();
-  const mt = String(mimetype || "").toLowerCase();
+  const mt = String(mimetype || "").toLowerCase().split(";")[0].trim();
 
   // avatar + immagini chat
   if (f === "avatar" || f === "image") return ALLOWED_IMAGE_MIMES.has(mt);
