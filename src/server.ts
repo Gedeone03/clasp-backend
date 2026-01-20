@@ -246,12 +246,6 @@ const upload = multer({
   storage,
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
   fileFilter: (_req: any, file: any, cb: any) => {
-    const ok = isAllowedUpload(String(file?.fieldname || ""), String(file?.mimetype || ""));
-console.log("[UPLOAD_REJECTED]", {
-  field: file?.fieldname,
-  mimetype: file?.mimetype,
-  originalname: file?.originalname,
-});
     if (!ok) return cb(new Error("Tipo file non consentito"));
     return cb(null, true);
   },
