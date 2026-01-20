@@ -182,23 +182,20 @@ const ALLOWED_VIDEO_MIMES = new Set([
 
 function isAllowedUpload(fieldname: string, mimetype: string): boolean {
   const f = String(fieldname || "").toLowerCase();
-  const mt = String(mimetype || "").toLowerCase();
+  const mt = String(mimetype || "").toLowerCase().split(";")[0].trim();
 
   // avatar + immagini chat
   if (f === "avatar" || f === "image") return ALLOWED_IMAGE_MIMES.has(mt);
 
-  // vocali
+  // audio
   if (f === "audio") return ALLOWED_AUDIO_MIMES.has(mt);
 
-  // allegati
-  if (f === "file") return ALLOWED_FILE_MIMES.has(mt);
+  // allegati: accetta sia "file" che "video" (alcuni frontend mandano video con fieldname=video)
+  if (f === "file" || f === "video") return ALLOWED_FILE_MIMES.has(mt);
 
-  // video
-  if (f === "video") return ALLOWED_VIDEO_MIMES.has(mt);
-
-  // default: blocca
   return false;
 }
+
 
 const upload = multer({
   storage,
