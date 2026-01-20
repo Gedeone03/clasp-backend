@@ -143,26 +143,83 @@ app.use(
   })
 );
 
-const storage = multer.diskStorage({
-  destination: (req: any, file: any, cb: any) => {
-    const field = String(file?.fieldname || "");
-    if (field === "avatar") return cb(null, AVATAR_DIR);
-    if (field === "audio") return cb(null, AUDIO_DIR);
-    if (field === "file") return cb(null, FILES_DIR);
-    if (field === "video") return cb(null, VIDEO_DIR);
-    // default: immagini chat
-    return cb(null, CHAT_IMG_DIR);
-  },
-  filename: (req: any, file: any, cb: any) => {
-    const ext = path.extname(file.originalname || "").slice(0, 12) || "";
-    const safe = `${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`;
-    cb(null, safe);
-  },
-});
+function normalizeMime(mimetype: string): string {
+  return String(mimetype || "").toLowerCase().split(";")[0].trim();
+}
 
-const ALLOWED_IMAGE_MIMES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif", "image/jpg", "image/pjpeg", "image/heic", "image/heif"]);
-const ALLOWED_AUDIO_MIMES = new Set(["audio/mpeg", "audio/wav", "audio/webm", "audio/ogg", "audio/mp4"]);
-const ALLOWED_FILE_MIMES = new Set([
+function extFromMime(mimetype: string): string {
+  const mt = normalizeMime(mimetype);
+  switch (mt) {
+    // immagini
+    case "image/jpeg":
+    case "image/jpg":
+      return ".jpg";
+    case "image/png":
+      return ".png";
+    case "image/webp":
+      return ".webp";
+    case "image/gif":
+      return ".gif";
+    case "image/heic":
+      return ".heic";
+    case "image/heif":
+      return ".heif";
+
+    // audio
+    case "audio/mpeg":
+      return ".mp3";
+    case "audio/wav":
+      return ".wav";
+    case "audio/webm":
+      return ".webm";
+    case "audio/ogg":
+      return ".ogg";
+    case "audio/mp4":
+      return ".m4a";
+
+    // video
+    case "video/mp4":
+      return ".mp4";
+    case "video/webm":
+      return ".webm";
+    case "video/quicktime":
+      return ".mov";
+    case "video/x-m4v":
+      return ".m4v";
+    case "video/ogg":
+      return ".ogv";
+
+    // docs
+    case "application/pdf":
+      return ".pdf";
+    case "application/zip":
+    case "application/x-zip-compressed":
+      return ".zip";
+
+    default:
+      return "";
+  }
+}
+
+const ALLOWED_IMAGE_MIMES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "image/heic",
+  "image/heif",
+]);
+
+const ALLOWED_AUDIO_MIMES = new Set([
+  "audio/mpeg",
+  "audio/wav",
+  "audio/webm",
+  "audio/ogg",
+  "audio/mp4",
+]);
+
+const ALLOWED_DOC_MIMES = new Set([
   "application/pdf",
   "application/zip",
   "application/x-zip-compressed",
@@ -178,31 +235,90 @@ const ALLOWED_VIDEO_MIMES = new Set([
   "video/webm",
   "video/quicktime",
   "video/x-m4v",
+  "video/ogg",
 ]);
 
-function isAllowedUpload(fieldname: string, mimetype: string): boolean {
+const ALLOWED_IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif", ".heic", ".heif"]);
+const ALLOWED_AUDIO_EXTS = new Set([".mp3", ".wav", ".webm", ".ogg", ".m4a", ".mp4"]);
+const ALLOWED_DOC_EXTS = new Set([".pdf", ".zip", ".txt", ".doc", ".docx", ".xls", ".xlsx"]);
+const ALLOWED_VIDEO_EXTS = new Set([".mp4", ".webm", ".mov", ".m4v", ".ogv"]);
+
+function isAllowedUpload(fieldname: string, mimetype: string, originalname: string): boolean {
   const f = String(fieldname || "").toLowerCase();
-  const mt = String(mimetype || "").toLowerCase().split(";")[0].trim();
+  const mt = normalizeMime(mimetype);
+  const ext = path.extname(String(originalname || "")).toLowerCase();
+
+  const isOctet = mt === "application/octet-stream" || mt === "";
 
   // avatar + immagini chat
-  if (f === "avatar" || f === "image") return ALLOWED_IMAGE_MIMES.has(mt);
+  if (f === "avatar" || f === "image") {
+    if (ALLOWED_IMAGE_MIMES.has(mt)) return true;
+    if (isOctet && ALLOWED_IMAGE_EXTS.has(ext)) return true;
+    return false;
+  }
 
-  // audio
-  if (f === "audio") return ALLOWED_AUDIO_MIMES.has(mt);
+  // vocali
+  if (f === "audio") {
+    if (ALLOWED_AUDIO_MIMES.has(mt)) return true;
+    if (isOctet && ALLOWED_AUDIO_EXTS.has(ext)) return true;
+    return false;
+  }
 
-  // allegati: accetta sia "file" che "video" (alcuni frontend mandano video con fieldname=video)
-  if (f === "file" || f === "video") return ALLOWED_FILE_MIMES.has(mt);
+  // allegati + video (alcuni client mandano video come "file")
+  if (f === "file" || f === "video") {
+    if (ALLOWED_DOC_MIMES.has(mt)) return true;
+    if (ALLOWED_VIDEO_MIMES.has(mt)) return true;
+
+    if (isOctet && (ALLOWED_DOC_EXTS.has(ext) || ALLOWED_VIDEO_EXTS.has(ext))) return true;
+    return false;
+  }
 
   return false;
 }
 
+const storage = multer.diskStorage({
+  destination: (_req: any, file: any, cb: any) => {
+    const field = String(file?.fieldname || "");
+    if (field === "avatar") return cb(null, AVATAR_DIR);
+    if (field === "audio") return cb(null, AUDIO_DIR);
+
+    // video spesso arriva come "file" oppure "video": salvalo in FILES_DIR
+    if (field === "file" || field === "video") return cb(null, FILES_DIR);
+
+    // default: immagini chat
+    return cb(null, CHAT_IMG_DIR);
+  },
+  filename: (_req: any, file: any, cb: any) => {
+    let ext = path.extname(String(file?.originalname || ""));
+    if (!ext) ext = extFromMime(String(file?.mimetype || ""));
+    ext = String(ext || "").toLowerCase().slice(0, 12);
+
+    const safe = `${Date.now()}_${Math.random().toString(16).slice(2)}${ext}`;
+    cb(null, safe);
+  },
+});
+
+// Default 50MB (cambiabile via env UPLOAD_MAX_MB)
+const UPLOAD_MAX_MB = Number(process.env.UPLOAD_MAX_MB || "50");
 
 const upload = multer({
   storage,
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  limits: { fileSize: UPLOAD_MAX_MB * 1024 * 1024 },
   fileFilter: (_req: any, file: any, cb: any) => {
-    const ok = isAllowedUpload(String(file?.fieldname || ""), String(file?.mimetype || ""));
-    if (!ok) return cb(new Error("Tipo file non consentito"));
+    const ok = isAllowedUpload(
+      String(file?.fieldname || ""),
+      String(file?.mimetype || ""),
+      String(file?.originalname || "")
+    );
+
+    if (!ok) {
+      console.warn("[UPLOAD_BLOCKED]", {
+        field: file?.fieldname,
+        mimetype: file?.mimetype,
+        originalname: file?.originalname,
+      });
+      return cb(new Error("Tipo file non consentito"));
+    }
     return cb(null, true);
   },
 });
