@@ -1,0 +1,21 @@
+[build]
+  publish = "dist"
+  command = "npm run build"
+
+# Assicura che service worker e manifest vengano serviti correttamente e non cacheati
+[[headers]]
+  for = "/service-worker.js"
+  [headers.values]
+    Content-Type = "application/javascript; charset=utf-8"
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+[[headers]]
+  for = "/manifest.webmanifest"
+  [headers.values]
+    Cache-Control = "no-cache, no-store, must-revalidate"
+
+# SPA routing: tutto va a index.html, MA non deve rompere i file statici
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

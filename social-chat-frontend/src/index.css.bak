@@ -7,7 +7,7 @@
 @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@300;400;600;700;800&display=swap');
 
 :root {
-  /* APP HEIGHT (iOS fix) */
+  /* ✅ iPhone fix: altezza reale viewport (impostata via JS in main.tsx) */
   --app-height: 100vh;
 
   /* PALETTE PRINCIPALE */
@@ -35,29 +35,24 @@
   --tiko-radius-sm: 8px;
 }
 
+/* ✅ iPhone fix: height coerente su tutta l’app */
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  height: var(--app-height, 100vh);
+  background: var(--tiko-bg-dark);
+  color: var(--tiko-text);
+  overflow: hidden;
+}
+
 /* RESET BASE */
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
   font-family: Nunito, sans-serif;
-}
-
-html, body {
-  height: 100%;
-  width: 100%;
-}
-
-body {
-  background: var(--tiko-bg-dark);
-  color: var(--tiko-text);
-  overflow: hidden;
-}
-
-/* IMPORTANT: root usa l’altezza reale (iPhone / Safari) */
-#root {
-  height: var(--app-height, 100vh);
-  width: 100%;
 }
 
 /* SCROLLBAR NEON SOFT */
@@ -203,3 +198,42 @@ button:disabled {
   flex-direction: column;
   background: var(--tiko-bg-dark);
 }
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+#root {
+  height: var(--app-height, 100vh);
+}
+function setupAppHeightVar() {
+  if (typeof window === "undefined") return;
+
+  const w: any = window as any;
+
+  // evita di registrare listener 2 volte (dev/StrictMode)
+  if (w.__claspAppHeightSetup) return;
+  w.__claspAppHeightSetup = true;
+
+  const set = () => {
+    const vv = window.visualViewport;
+    const h = (vv && vv.height) ? Math.round(vv.height) : window.innerHeight;
+    document.documentElement.style.setProperty("--app-height", `${h}px`);
+  };
+
+  set();
+
+  window.addEventListener("resize", set);
+  window.addEventListener("orientationchange", set);
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", set);
+    window.visualViewport.addEventListener("scroll", set);
+  }
+
+  // quando cambia focus (tastiera)
+  window.addEventListener("focusin", set);
+  window.addEventListener("focusout", set);
+}
+
+setupAppHeightVar();

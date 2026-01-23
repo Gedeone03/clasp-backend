@@ -1,0 +1,2088 @@
+diff -ruN a/src/components/RealtimeBridge.tsx b/src/components/RealtimeBridge.tsx
+--- a/src/components/RealtimeBridge.tsx	1970-01-01 00:00:00.000000000 +0000
++++ b/src/components/RealtimeBridge.tsx	2025-12-27 07:12:32.675252074 +0000
+@@ -0,0 +1,265 @@
++import React, { useEffect, useRef } from "react";
++import { useAuth } from "../AuthContext";
++import * as api from "../api";
++import { useChatSocket } from "../hooks/useChatSocket";
++import { playNotificationBeep, unlockAudio } from "../utils/notifySound";
++
++const LS_UNREAD_COUNTS = "clasp_unread_counts_v1";
++const LS_UNREAD_TOTAL = "clasp_unread_total_v1";
++const LS_ACTIVE_CONV = "clasp_active_conversation_v1";
++const LS_FRIEND_REQ_RECEIVED = "clasp_friend_requests_received_v1";
++
++function safeJsonParse<T>(raw: string | null, fallback: T): T {
++  try {
++    if (!raw) return fallback;
++    return JSON.parse(raw) as T;
++  } catch {
++    return fallback;
++  }
++}
++
++function readUnreadCounts(): Record<number, number> {
++  const raw = safeJsonParse<Record<string, any>>(localStorage.getItem(LS_UNREAD_COUNTS), {});
++  const out: Record<number, number> = {};
++  for (const [k, v] of Object.entries(raw || {})) {
++    const cid = Number(k);
++    const n = Number(v);
++    if (!cid || !Number.isFinite(cid)) continue;
++    if (!Number.isFinite(n) || n <= 0) continue;
++    out[cid] = Math.floor(n);
++  }
++  return out;
++}
++
++function writeUnreadCounts(counts: Record<number, number>) {
++  const clean: Record<string, number> = {};
++  let total = 0;
++
++  for (const [k, v] of Object.entries(counts || {})) {
++    const cid = Number(k);
++    const n = Number(v);
++    if (!cid || !Number.isFinite(cid)) continue;
++    if (!Number.isFinite(n) || n <= 0) continue;
++    const nn = Math.floor(n);
++    clean[String(cid)] = nn;
++    total += nn;
++  }
++
++  try {
++    localStorage.setItem(LS_UNREAD_COUNTS, JSON.stringify(clean));
++    localStorage.setItem(LS_UNREAD_TOTAL, String(total));
++  } catch {
++    // ignore
++  }
++
++  try {
++    window.dispatchEvent(new Event("clasp:badge"));
++  } catch {
++    // ignore
++  }
++}
++
++function setFriendReqReceivedCount(n: number) {
++  const nn = Math.max(0, Math.floor(Number(n) || 0));
++  try {
++    localStorage.setItem(LS_FRIEND_REQ_RECEIVED, String(nn));
++  } catch {
++    // ignore
++  }
++  try {
++    window.dispatchEvent(new Event("clasp:badge"));
++  } catch {
++    // ignore
++  }
++}
++
++function clearBadgeStorage() {
++  try {
++    localStorage.removeItem(LS_UNREAD_COUNTS);
++    localStorage.removeItem(LS_UNREAD_TOTAL);
++    localStorage.removeItem(LS_ACTIVE_CONV);
++    localStorage.removeItem(LS_FRIEND_REQ_RECEIVED);
++  } catch {
++    // ignore
++  }
++  try {
++    window.dispatchEvent(new Event("clasp:badge"));
++  } catch {
++    // ignore
++  }
++}
++
++function extractMessagePayload(payload: any): { conversationId: number; message: any } | null {
++  if (!payload) return null;
++
++  // server emits: { conversationId, message }
++  const msg = payload?.message ?? payload?.data?.message ?? payload?.msg ?? payload;
++  const cid = Number(payload?.conversationId || msg?.conversationId || 0);
++
++  if (!cid) return null;
++  return { conversationId: cid, message: msg };
++}
++
++/**
++ * ✅ RealtimeBridge
++ * - single Socket.IO connection (JWT auth)
++ * - joins all conversations periodically (to receive message events)
++ * - updates:
++ *   - unread badges (per conversation + total)
++ *   - friend requests received badge (polling)
++ * - dispatches browser events for pages:
++ *   - "clasp:message" (detail: { conversationId, message })
++ *   - "clasp:badge" (simple event)
++ */
++export default function RealtimeBridge() {
++  const { user } = useAuth();
++  const myId = Number((user as any)?.id || 0) || null;
++
++  // avoid repeated joins spam when multiple rerenders happen
++  const joinedOnceRef = useRef(false);
++
++  // Unlock audio on first user interaction (mobile browsers require a gesture)
++  useEffect(() => {
++    let done = false;
++
++    const tryUnlock = async () => {
++      if (done) return;
++      const ok = await unlockAudio().catch(() => false);
++      if (ok) {
++        done = true;
++        window.removeEventListener("pointerdown", tryUnlock);
++        window.removeEventListener("keydown", tryUnlock);
++      }
++    };
++
++    window.addEventListener("pointerdown", tryUnlock);
++    window.addEventListener("keydown", tryUnlock);
++
++    return () => {
++      window.removeEventListener("pointerdown", tryUnlock);
++      window.removeEventListener("keydown", tryUnlock);
++    };
++  }, []);
++
++  // When user logs out, clear local badges.
++  useEffect(() => {
++    if (!user) {
++      clearBadgeStorage();
++    }
++  }, [user]);
++
++  const socketApi = useChatSocket(myId, {
++    onMessage: async (payload: any) => {
++      const parsed = extractMessagePayload(payload);
++      if (!parsed) return;
++
++      const cid = Number(parsed.conversationId);
++      const msg = parsed.message;
++
++      // Notify pages (HomePage will update UI in real-time)
++      try {
++        window.dispatchEvent(new CustomEvent("clasp:message", { detail: { conversationId: cid, message: msg } }));
++      } catch {
++        // ignore
++      }
++
++      // Unread + sound only for incoming messages
++      const senderId = Number(msg?.senderId || 0);
++      if (myId && senderId === myId) return;
++
++      const activeCid = Number(localStorage.getItem(LS_ACTIVE_CONV) || 0);
++      const isActiveConversation = document.visibilityState === "visible" && activeCid === cid;
++
++      // if I'm currently in that chat, keep it read
++      if (isActiveConversation) {
++        const counts = readUnreadCounts();
++        if (counts[cid]) {
++          delete counts[cid];
++          writeUnreadCounts(counts);
++        }
++        return;
++      }
++
++      // increment unread
++      const counts = readUnreadCounts();
++      counts[cid] = (counts[cid] || 0) + 1;
++      writeUnreadCounts(counts);
++
++      // beep (best effort)
++      try {
++        await playNotificationBeep();
++      } catch {
++        // ignore
++      }
++    },
++  });
++
++  // Join all conversations periodically so we receive message events for all chats.
++  useEffect(() => {
++    if (!myId) return;
++
++    let alive = true;
++
++    const joinAll = async () => {
++      try {
++        const convs = await (api as any).fetchConversations?.();
++        if (!alive) return;
++
++        const arr = Array.isArray(convs) ? convs : [];
++        for (const c of arr) {
++          const cid = Number((c as any)?.id || 0);
++          if (cid) socketApi.joinConversation(cid);
++        }
++      } catch {
++        // ignore
++      }
++    };
++
++    // initial join (a couple of retries to cover slow auth init)
++    joinAll();
++    const t1 = window.setTimeout(joinAll, 1200);
++    const t2 = window.setTimeout(joinAll, 3500);
++
++    // periodic re-join (idempotent)
++    const iv = window.setInterval(joinAll, 20000);
++
++    joinedOnceRef.current = true;
++
++    return () => {
++      alive = false;
++      window.clearTimeout(t1);
++      window.clearTimeout(t2);
++      window.clearInterval(iv);
++      joinedOnceRef.current = false;
++    };
++  }, [myId, socketApi]);
++
++  // Poll friend requests received → badge on "Amici"
++  useEffect(() => {
++    if (!myId) return;
++
++    let alive = true;
++
++    const tick = async () => {
++      try {
++        const received = await (api as any).fetchFriendRequestsReceived?.();
++        if (!alive) return;
++
++        const arr = Array.isArray(received) ? received : [];
++        setFriendReqReceivedCount(arr.length);
++      } catch {
++        // ignore
++      }
++    };
++
++    tick();
++    const iv = window.setInterval(tick, 25000);
++
++    return () => {
++      alive = false;
++      window.clearInterval(iv);
++    };
++  }, [myId]);
++
++  return null;
++}
+diff -ruN a/src/components/ui/ChatWindow.tsx b/src/components/ui/ChatWindow.tsx
+--- a/src/components/ui/ChatWindow.tsx	2025-12-27 00:18:14.000000000 +0000
++++ b/src/components/ui/ChatWindow.tsx	2025-12-27 07:10:58.635287756 +0000
+@@ -212,6 +212,8 @@
+   const fileInputRef = useRef<HTMLInputElement | null>(null);
+   const voiceInputRef = useRef<HTMLInputElement | null>(null);
+ 
++  const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
++
+   const listRef = useRef<HTMLDivElement | null>(null);
+ 
+   const sorted = useMemo(() => {
+@@ -244,6 +246,9 @@
+       const msg = await sendMessage(convId, content, null);
+       try { onMessageCreated?.(msg); } catch { /* ignore */ }
+       setText("");
++      requestAnimationFrame(() => {
++        try { textAreaRef.current?.focus(); } catch { /* ignore */ }
++      });
+     } catch (e: any) {
+       const detail = String(e?.message || "");
+       setErr(detail ? `${t("chatSendError")}: ${detail}` : t("chatSendError"));
+@@ -553,6 +558,7 @@
+           </button>
+ 
+           <textarea
++            ref={textAreaRef}
+             value={text}
+             onChange={(e) => setText(e.target.value)}
+             placeholder={t("chatWriteMessagePlaceholder")}
+@@ -571,7 +577,15 @@
+ 
+           <button
+             type="button"
+-            onClick={handleSend}
++            onMouseDown={(e) => {
++              // Prevent focus-steal on mobile (keyboard closing)
++              try { e.preventDefault(); } catch { /* ignore */ }
++            }}
++            onClick={(e) => {
++              try { e.preventDefault(); } catch { /* ignore */ }
++              try { textAreaRef.current?.focus(); } catch { /* ignore */ }
++              handleSend();
++            }}
+             disabled={busy || !text.trim()}
+             style={{
+               padding: "10px 12px",
+diff -ruN a/src/components/ui/Sidebar.tsx b/src/components/ui/Sidebar.tsx
+--- a/src/components/ui/Sidebar.tsx	2025-12-26 18:44:30.000000000 +0000
++++ b/src/components/ui/Sidebar.tsx	2025-12-27 07:13:25.952435256 +0000
+@@ -4,6 +4,44 @@
+ import { useAuth } from "../../AuthContext";
+ import { useI18n } from "../../LanguageContext";
+ 
++const LS_UNREAD_TOTAL = "clasp_unread_total_v1";
++const LS_FRIEND_REQ_RECEIVED = "clasp_friend_requests_received_v1";
++
++function readBadgeNumber(key: string): number {
++  try {
++    return Math.max(0, Math.floor(Number(localStorage.getItem(key) || 0)));
++  } catch {
++    return 0;
++  }
++}
++
++function Badge({ n }: { n: number }) {
++  if (!n) return null;
++  const v = n > 99 ? "99+" : String(n);
++
++  return (
++    <div
++      style={{
++        minWidth: 22,
++        height: 22,
++        padding: "0 7px",
++        borderRadius: 999,
++        background: "#ff3b30",
++        color: "#fff",
++        fontSize: 12,
++        fontWeight: 950,
++        display: "flex",
++        alignItems: "center",
++        justifyContent: "center",
++        flexShrink: 0,
++      }}
++      title={v}
++    >
++      {v}
++    </div>
++  );
++}
++
+ function useIsMobile(breakpointPx = 1100) {
+   const compute = () => {
+     const coarse =
+@@ -113,11 +151,34 @@
+ 
+   const [drawerOpen, setDrawerOpen] = useState(false);
+ 
++  const [unreadTotal, setUnreadTotal] = useState<number>(() => readBadgeNumber(LS_UNREAD_TOTAL));
++  const [friendReqCount, setFriendReqCount] = useState<number>(() => readBadgeNumber(LS_FRIEND_REQ_RECEIVED));
++
+   useEffect(() => {
+     if (drawerOpen) setDrawerOpen(false);
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [location.pathname, location.search]);
+ 
++  // Sync badges from localStorage (updated by RealtimeBridge)
++  useEffect(() => {
++    const refresh = () => {
++      setUnreadTotal(readBadgeNumber(LS_UNREAD_TOTAL));
++      setFriendReqCount(readBadgeNumber(LS_FRIEND_REQ_RECEIVED));
++    };
++
++    refresh();
++
++    const onBadge = () => refresh();
++    window.addEventListener("clasp:badge", onBadge as any);
++
++    const iv = window.setInterval(refresh, 2000);
++
++    return () => {
++      window.removeEventListener("clasp:badge", onBadge as any);
++      window.clearInterval(iv);
++    };
++  }, []);
++
+   const avatarUrl = resolveUrlMaybeBackend((user as any)?.avatarUrl);
+ 
+   const baseItemStyle: React.CSSProperties = {
+@@ -219,10 +280,12 @@
+     <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
+       <NavLink to="/" style={({ isActive }) => ({ ...baseItemStyle, background: isActive ? activeBg : "transparent" })}>
+         <span>{t("navHome")}</span>
++        <Badge n={unreadTotal} />
+       </NavLink>
+ 
+       <NavLink to="/friends" style={({ isActive }) => ({ ...baseItemStyle, background: isActive ? activeBg : "transparent" })}>
+         <span>{t("navFriends")}</span>
++        <Badge n={friendReqCount} />
+       </NavLink>
+ 
+       <NavLink to="/profile" style={({ isActive }) => ({ ...baseItemStyle, background: isActive ? activeBg : "transparent" })}>
+@@ -266,6 +329,7 @@
+     <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 12 }}>
+       <Link to="/?view=chats" style={baseItemStyle}>
+         <span>{t("navChat")}</span>
++        <Badge n={unreadTotal} />
+       </Link>
+ 
+       <Link to="/?view=search" style={baseItemStyle}>
+@@ -274,6 +338,7 @@
+ 
+       <NavLink to="/friends" style={({ isActive }) => ({ ...baseItemStyle, background: isActive ? activeBg : "transparent" })}>
+         <span>{t("navFriends")}</span>
++        <Badge n={friendReqCount} />
+       </NavLink>
+ 
+       <NavLink to="/profile" style={({ isActive }) => ({ ...baseItemStyle, background: isActive ? activeBg : "transparent" })}>
+diff -ruN a/src/hooks/useChatSocket.ts b/src/hooks/useChatSocket.ts
+--- a/src/hooks/useChatSocket.ts	2025-12-17 18:16:54.000000000 +0000
++++ b/src/hooks/useChatSocket.ts	2025-12-27 07:11:30.958286104 +0000
+@@ -1,88 +1,91 @@
+-import { useEffect, useMemo, useRef } from "react";
+-import { io, Socket } from "socket.io-client";
+-import { API_BASE_URL } from "../config";
+-
+-type Events = {
+-  onMessage?: (payload: any) => void; // useremo anche per update/delete (upsert)
+-  onConversationNew?: (payload: any) => void;
+-  onUserOnline?: (payload: any) => void;
+-  onUserOffline?: (payload: any) => void;
+-  onTyping?: (payload: any) => void;
+-};
+-
+-function normalizeBaseUrl(url: string) {
+-  return url.replace(/\/+$/, "");
+-}
+-
+-export function useChatSocket(userId: number | null, events: Events) {
+-  const socketRef = useRef<Socket | null>(null);
+-  const eventsRef = useRef<Events>(events);
+-
+-  useEffect(() => {
+-    eventsRef.current = events;
+-  }, [events]);
+-
+-  const baseUrl = useMemo(() => normalizeBaseUrl(API_BASE_URL), []);
+-
+-  useEffect(() => {
+-    if (!userId) {
+-      socketRef.current?.disconnect();
+-      socketRef.current = null;
+-      return;
+-    }
+-
+-    const socket = io(baseUrl, {
+-      transports: ["websocket", "polling"],
+-      withCredentials: true,
+-      reconnection: true,
+-      reconnectionAttempts: Infinity,
+-      reconnectionDelay: 800,
+-      reconnectionDelayMax: 5000,
+-      timeout: 20000,
+-      auth: { userId },
+-    });
+-
+-    socketRef.current = socket;
+-
+-    socket.on("message:new", (payload) => eventsRef.current.onMessage?.(payload));
+-    socket.on("message:update", (payload) => eventsRef.current.onMessage?.(payload));
+-    socket.on("message:delete", (payload) => eventsRef.current.onMessage?.(payload));
+-
+-    socket.on("conversation:new", (payload) => eventsRef.current.onConversationNew?.(payload));
+-    socket.on("user:online", (payload) => eventsRef.current.onUserOnline?.(payload));
+-    socket.on("user:offline", (payload) => eventsRef.current.onUserOffline?.(payload));
+-    socket.on("user:typing", (payload) => eventsRef.current.onTyping?.(payload));
+-
+-    const handleVisibility = () => {
+-      if (document.visibilityState === "visible" && socketRef.current && !socketRef.current.connected) {
+-        socketRef.current.connect();
+-      }
+-    };
+-    const handleOnline = () => {
+-      if (socketRef.current && !socketRef.current.connected) socketRef.current.connect();
+-    };
+-
+-    document.addEventListener("visibilitychange", handleVisibility);
+-    window.addEventListener("online", handleOnline);
+-
+-    return () => {
+-      document.removeEventListener("visibilitychange", handleVisibility);
+-      window.removeEventListener("online", handleOnline);
+-
+-      socket.removeAllListeners();
+-      socket.disconnect();
+-      socketRef.current = null;
+-    };
+-  }, [userId, baseUrl]);
+-
+-  const api = useMemo(() => {
+-    return {
+-      joinConversation: (conversationId: number) => socketRef.current?.emit("conversation:join", { conversationId }),
+-      sendMessage: (conversationId: number, content: string, replyToId?: number | null) =>
+-        socketRef.current?.emit("message:send", { conversationId, content, replyToId: replyToId ?? null }),
+-      sendTyping: (conversationId: number) => socketRef.current?.emit("typing", { conversationId }),
+-    };
+-  }, []);
+-
+-  return api;
+-}
++import { useEffect, useMemo, useRef } from "react";
++import { io, Socket } from "socket.io-client";
++import { API_BASE_URL } from "../config";
++import { getAuthToken } from "../api";
++
++type Events = {
++  onMessage?: (payload: any) => void; // useremo anche per update/delete (upsert)
++  onConversationNew?: (payload: any) => void;
++  onUserOnline?: (payload: any) => void;
++  onUserOffline?: (payload: any) => void;
++  onTyping?: (payload: any) => void;
++};
++
++function normalizeBaseUrl(url: string) {
++  return url.replace(/\/+$/, "");
++}
++
++export function useChatSocket(userId: number | null, events: Events) {
++  const socketRef = useRef<Socket | null>(null);
++  const eventsRef = useRef<Events>(events);
++
++  useEffect(() => {
++    eventsRef.current = events;
++  }, [events]);
++
++  const baseUrl = useMemo(() => normalizeBaseUrl(API_BASE_URL), []);
++
++  useEffect(() => {
++    if (!userId) {
++      socketRef.current?.disconnect();
++      socketRef.current = null;
++      return;
++    }
++
++    const socket = io(baseUrl, {
++      transports: ["websocket", "polling"],
++      withCredentials: true,
++      reconnection: true,
++      reconnectionAttempts: Infinity,
++      reconnectionDelay: 800,
++      reconnectionDelayMax: 5000,
++      timeout: 20000,
++      auth: { token: getAuthToken() },
++    });
++
++    socketRef.current = socket;
++
++    socket.on("message:new", (payload) => eventsRef.current.onMessage?.(payload));
++    socket.on("message", (payload) => eventsRef.current.onMessage?.(payload)); // compat alias
++    socket.on("message:update", (payload) => eventsRef.current.onMessage?.(payload));
++    socket.on("message:delete", (payload) => eventsRef.current.onMessage?.(payload));
++
++    socket.on("conversation:new", (payload) => eventsRef.current.onConversationNew?.(payload));
++    socket.on("user:online", (payload) => eventsRef.current.onUserOnline?.(payload));
++    socket.on("user:offline", (payload) => eventsRef.current.onUserOffline?.(payload));
++    socket.on("typing", (payload) => eventsRef.current.onTyping?.(payload));
++    socket.on("user:typing", (payload) => eventsRef.current.onTyping?.(payload)); // legacy
++
++    const handleVisibility = () => {
++      if (document.visibilityState === "visible" && socketRef.current && !socketRef.current.connected) {
++        socketRef.current.connect();
++      }
++    };
++    const handleOnline = () => {
++      if (socketRef.current && !socketRef.current.connected) socketRef.current.connect();
++    };
++
++    document.addEventListener("visibilitychange", handleVisibility);
++    window.addEventListener("online", handleOnline);
++
++    return () => {
++      document.removeEventListener("visibilitychange", handleVisibility);
++      window.removeEventListener("online", handleOnline);
++
++      socket.removeAllListeners();
++      socket.disconnect();
++      socketRef.current = null;
++    };
++  }, [userId, baseUrl]);
++
++  const api = useMemo(() => {
++    return {
++      joinConversation: (conversationId: number) => socketRef.current?.emit("conversation:join", { conversationId }),
++      sendMessage: (conversationId: number, content: string, replyToId?: number | null) =>
++        socketRef.current?.emit("message:send", { conversationId, content, replyToId: replyToId ?? null }),
++      sendTyping: (conversationId: number) => socketRef.current?.emit("typing", { conversationId }),
++    };
++  }, []);
++
++  return api;
++}
+diff -ruN a/src/main.tsx b/src/main.tsx
+--- a/src/main.tsx	2025-12-19 20:31:47.000000000 +0000
++++ b/src/main.tsx	2025-12-27 07:12:44.043600692 +0000
+@@ -1,81 +1,89 @@
+-import React from "react";
+-import ReactDOM from "react-dom/client";
+-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+-import "./index.css";
+-
+-import { AuthProvider } from "./AuthContext";
+-import { LanguageProvider } from "./LanguageContext";
+-
+-import HomePage from "./pages/HomePage";
+-import AuthPage from "./pages/AuthPage";
+-import FriendsPage from "./pages/FriendsPage";
+-import ProfilePage from "./pages/ProfilePage";
+-import SettingsPage from "./pages/SettingsPage";
+-import TermsPage from "./pages/TermsPage";
+-import PrivacyPage from "./pages/PrivacyPage";
+-
+-function RequireAuth({ children }: { children: JSX.Element }) {
+-  const token = localStorage.getItem("token");
+-  return token ? children : <Navigate to="/auth" replace />;
+-}
+-
+-function App() {
+-  return (
+-    <Routes>
+-      <Route
+-        path="/"
+-        element={
+-          <RequireAuth>
+-            <HomePage />
+-          </RequireAuth>
+-        }
+-      />
+-
+-      <Route path="/auth" element={<AuthPage />} />
+-
+-      <Route
+-        path="/friends"
+-        element={
+-          <RequireAuth>
+-            <FriendsPage />
+-          </RequireAuth>
+-        }
+-      />
+-
+-      <Route
+-        path="/profile"
+-        element={
+-          <RequireAuth>
+-            <ProfilePage />
+-          </RequireAuth>
+-        }
+-      />
+-
+-      <Route
+-        path="/settings"
+-        element={
+-          <RequireAuth>
+-            <SettingsPage />
+-          </RequireAuth>
+-        }
+-      />
+-
+-      <Route path="/terms" element={<TermsPage />} />
+-      <Route path="/privacy" element={<PrivacyPage />} />
+-
+-      <Route path="*" element={<Navigate to="/" replace />} />
+-    </Routes>
+-  );
+-}
+-
+-ReactDOM.createRoot(document.getElementById("root")!).render(
+-  <React.StrictMode>
+-    <BrowserRouter>
+-      <LanguageProvider>
+-        <AuthProvider>
+-          <App />
+-        </AuthProvider>
+-      </LanguageProvider>
+-    </BrowserRouter>
+-  </React.StrictMode>
+-);
++import React from "react";
++import ReactDOM from "react-dom/client";
++import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
++import "./index.css";
++
++import { AuthProvider } from "./AuthContext";
++import { LanguageProvider } from "./LanguageContext";
++
++import HomePage from "./pages/HomePage";
++import AuthPage from "./pages/AuthPage";
++import FriendsPage from "./pages/FriendsPage";
++import ProfilePage from "./pages/ProfilePage";
++import SettingsPage from "./pages/SettingsPage";
++import TermsPage from "./pages/TermsPage";
++import PrivacyPage from "./pages/PrivacyPage";
++import RealtimeBridge from "./components/RealtimeBridge";
++
++function RequireAuth({ children }: { children: JSX.Element }) {
++  const token = localStorage.getItem("token");
++  return token ? (
++    <>
++      <RealtimeBridge />
++      {children}
++    </>
++  ) : (
++    <Navigate to="/auth" replace />
++  );
++}
++
++function App() {
++  return (
++    <Routes>
++      <Route
++        path="/"
++        element={
++          <RequireAuth>
++            <HomePage />
++          </RequireAuth>
++        }
++      />
++
++      <Route path="/auth" element={<AuthPage />} />
++
++      <Route
++        path="/friends"
++        element={
++          <RequireAuth>
++            <FriendsPage />
++          </RequireAuth>
++        }
++      />
++
++      <Route
++        path="/profile"
++        element={
++          <RequireAuth>
++            <ProfilePage />
++          </RequireAuth>
++        }
++      />
++
++      <Route
++        path="/settings"
++        element={
++          <RequireAuth>
++            <SettingsPage />
++          </RequireAuth>
++        }
++      />
++
++      <Route path="/terms" element={<TermsPage />} />
++      <Route path="/privacy" element={<PrivacyPage />} />
++
++      <Route path="*" element={<Navigate to="/" replace />} />
++    </Routes>
++  );
++}
++
++ReactDOM.createRoot(document.getElementById("root")!).render(
++  <React.StrictMode>
++    <BrowserRouter>
++      <LanguageProvider>
++        <AuthProvider>
++          <App />
++        </AuthProvider>
++      </LanguageProvider>
++    </BrowserRouter>
++  </React.StrictMode>
++);
+diff -ruN a/src/pages/FriendsPage.tsx b/src/pages/FriendsPage.tsx
+--- a/src/pages/FriendsPage.tsx	2025-12-26 18:50:20.000000000 +0000
++++ b/src/pages/FriendsPage.tsx	2025-12-27 07:21:07.638402423 +0000
+@@ -1,4 +1,4 @@
+-import React, { useEffect, useMemo, useState } from "react";
++import React, { useCallback, useEffect, useMemo, useState } from "react";
+ import { useNavigate } from "react-router-dom";
+ import Sidebar from "../components/ui/Sidebar";
+ import { API_BASE_URL } from "../config";
+@@ -8,6 +8,24 @@
+ 
+ type Friend = { id: number; username?: string; displayName?: string; avatarUrl?: string | null };
+ 
++type FriendRequestReceived = {
++  id: number;
++  senderId: number;
++  receiverId: number;
++  createdAt?: string;
++  sender?: Friend;
++};
++
++type FriendRequestSent = {
++  id: number;
++  senderId: number;
++  receiverId: number;
++  createdAt?: string;
++  receiver?: Friend;
++};
++
++const LS_FRIEND_REQ_RECEIVED = "clasp_friend_requests_received_v1";
++
+ function getToken(): string {
+   return localStorage.getItem("token") || localStorage.getItem("authToken") || localStorage.getItem("accessToken") || "";
+ }
+@@ -37,55 +55,80 @@
+   return m;
+ }
+ 
++async function fetchAuthed(path: string, token: string, init?: RequestInit) {
++  const headers: Record<string, string> = {
++    ...(token ? { Authorization: `Bearer ${token}` } : {}),
++    ...(init?.headers as any),
++  };
++
++  const res = await fetch(`${baseUrl()}${path}`, {
++    ...init,
++    headers,
++  });
++
++  if (!res.ok) {
++    const txt = await res.text().catch(() => "");
++    throw new Error(txt || `HTTP ${res.status}`);
++  }
++  return res.json().catch(() => null);
++}
++
+ export default function FriendsPage() {
+   const nav = useNavigate();
+   const isMobile = useIsMobile(900);
+   const { t } = useI18n();
+ 
+-  const auth = useAuth() as any;
+-  const user = auth.user as any;
++  useAuth();
+ 
+   const [friends, setFriends] = useState<Friend[]>([]);
++  const [receivedReqs, setReceivedReqs] = useState<FriendRequestReceived[]>([]);
++  const [sentReqs, setSentReqs] = useState<FriendRequestSent[]>([]);
+   const [busy, setBusy] = useState(false);
+   const [err, setErr] = useState<string | null>(null);
++  const [info, setInfo] = useState<string | null>(null);
+ 
+   const token = useMemo(() => getToken(), []);
+ 
+-  useEffect(() => {
++  const refreshAll = useCallback(async () => {
+     if (!token) return;
+ 
+-    let alive = true;
+     setBusy(true);
+     setErr(null);
+ 
+-    (async () => {
++    try {
++      const [friendsData, receivedData, sentData] = await Promise.all([
++        fetchAuthed("/friends", token),
++        fetchAuthed("/friends/requests/received", token),
++        fetchAuthed("/friends/requests/sent", token),
++      ]);
++
++      const friendsArr = Array.isArray(friendsData) ? (friendsData as Friend[]) : [];
++      const recArr = Array.isArray(receivedData) ? (receivedData as FriendRequestReceived[]) : [];
++      const sentArr = Array.isArray(sentData) ? (sentData as FriendRequestSent[]) : [];
++
++      setFriends(friendsArr);
++      setReceivedReqs(recArr);
++      setSentReqs(sentArr);
++
++      // Update badge (visual signal on Sidebar)
+       try {
+-        const res = await fetch(`${baseUrl()}/friends`, {
+-          headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+-        });
+-
+-        if (!res.ok) {
+-          const txt = await res.text().catch(() => "");
+-          throw new Error(txt || `HTTP ${res.status}`);
+-        }
+-
+-        const data = await res.json().catch(() => []);
+-        if (!alive) return;
+-        setFriends(Array.isArray(data) ? data : []);
+-      } catch (e: any) {
+-        if (!alive) return;
+-        setErr(`${t("friendsError")}: ${e?.message || ""}`.trim());
+-      } finally {
+-        if (!alive) return;
+-        setBusy(false);
++        localStorage.setItem(LS_FRIEND_REQ_RECEIVED, String(recArr.length));
++        window.dispatchEvent(new Event("clasp:badge"));
++      } catch {
++        // ignore
+       }
+-    })();
+-
+-    return () => {
+-      alive = false;
+-    };
++    } catch (e: any) {
++      setErr(`${t("friendsErrorLoad")}: ${e?.message || ""}`.trim());
++    } finally {
++      setBusy(false);
++    }
+   }, [token, t]);
+ 
++  useEffect(() => {
++    if (!token) return;
++    void refreshAll();
++  }, [token, refreshAll]);
++
+   async function openChatWithFriend(friendId: number) {
+     // Prefer creating (or getting) a conversation server-side so Home can open it reliably.
+     try {
+@@ -103,6 +146,34 @@
+     nav(`/?uid=${friendId}`);
+   }
+ 
++  async function acceptRequest(requestId: number) {
++    if (!token) return;
++    setInfo(null);
++    setErr(null);
++
++    try {
++      await fetchAuthed(`/friends/requests/${requestId}/accept`, token, { method: "POST" });
++      setInfo(t("friendsAcceptedMsg"));
++      await refreshAll();
++    } catch (e: any) {
++      setErr(`${t("friendsErrorLoad")}: ${e?.message || ""}`.trim());
++    }
++  }
++
++  async function declineRequest(requestId: number) {
++    if (!token) return;
++    setInfo(null);
++    setErr(null);
++
++    try {
++      await fetchAuthed(`/friends/requests/${requestId}/decline`, token, { method: "POST" });
++      setInfo(t("friendsDeclinedMsg"));
++      await refreshAll();
++    } catch (e: any) {
++      setErr(`${t("friendsErrorLoad")}: ${e?.message || ""}`.trim());
++    }
++  }
++
+   const card: React.CSSProperties = {
+     maxWidth: 820,
+     margin: "0 auto",
+@@ -116,6 +187,32 @@
+     ? { position: "fixed", inset: 0, zIndex: 999, background: "var(--tiko-bg-dark)", display: "flex", flexDirection: "column" }
+     : { height: "100vh", display: "flex", overflow: "hidden", background: "var(--tiko-bg-dark)" };
+ 
++  const sectionTitle: React.CSSProperties = { margin: "14px 0 10px", fontWeight: 950, fontSize: 14 };
++
++  const pillBtn: React.CSSProperties = {
++    padding: "8px 10px",
++    borderRadius: 12,
++    border: "1px solid #2a2a2a",
++    background: "transparent",
++    color: "var(--tiko-text)",
++    fontWeight: 950,
++    cursor: "pointer",
++    whiteSpace: "nowrap",
++  };
++
++  const pillBtnOk: React.CSSProperties = {
++    ...pillBtn,
++    borderColor: "var(--tiko-mint)",
++    background: "var(--tiko-mint)",
++    color: "#000",
++  };
++
++  const pillBtnDanger: React.CSSProperties = {
++    ...pillBtn,
++    borderColor: "#3a1f1f",
++    color: "#ff6b6b",
++  };
++
+   return (
+     <div style={pageWrap}>
+       {!isMobile && <Sidebar />}
+@@ -138,18 +235,28 @@
+         <div style={card}>
+           <h2 style={{ marginTop: 0 }}>{t("friendsTitle")}</h2>
+ 
+-          {busy ? <div style={{ color: "var(--tiko-text-dim)" }}>{t("genericLoading")}</div> : null}
++          {busy ? <div style={{ color: "var(--tiko-text-dim)" }}>{t("friendsLoading")}</div> : null}
++
++          {info ? (
++            <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 12, border: "1px solid #2a2a2a", color: "var(--tiko-text)", fontWeight: 900 }}>
++              {info}
++            </div>
++          ) : null}
++
+           {err ? (
+             <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 12, border: "1px solid #3a1f1f", background: "rgba(255,59,48,0.08)", color: "#ff6b6b", fontWeight: 900 }}>
+               {err}
+             </div>
+           ) : null}
+ 
++          {/* Friends list */}
++          <div style={sectionTitle}>{t("friendsYourFriends")}</div>
++
+           {!busy && !err && friends.length === 0 ? (
+-            <div style={{ marginTop: 10, color: "var(--tiko-text-dim)" }}>{t("friendsNoFriends")}</div>
++            <div style={{ marginTop: 6, color: "var(--tiko-text-dim)" }}>{t("friendsNoFriends")}</div>
+           ) : null}
+ 
+-          <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
++          <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
+             {friends.map((f) => {
+               const avatar = resolveUrl(f.avatarUrl);
+               return (
+@@ -173,13 +280,95 @@
+                     </div>
+                   </div>
+ 
+-                  <div style={{ color: "var(--tiko-text-dim)", fontWeight: 900 }}>
+-                    →
++                  <div style={{ color: "var(--tiko-text-dim)", fontWeight: 900 }}>→</div>
++                </div>
++              );
++            })}
++          </div>
++
++          {/* Received requests */}
++          <div style={sectionTitle}>{t("friendsRequestsReceived")}</div>
++
++          {!busy && !err && receivedReqs.length === 0 ? (
++            <div style={{ marginTop: 6, color: "var(--tiko-text-dim)" }}>{t("friendsNoRequestsReceived")}</div>
++          ) : null}
++
++          <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
++            {receivedReqs.map((r) => {
++              const u = (r as any).sender as Friend | undefined;
++              const avatar = resolveUrl(u?.avatarUrl);
++              return (
++                <div
++                  key={r.id}
++                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: 12, borderRadius: 14, border: "1px solid #232323" }}
++                >
++                  <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
++                    <div style={{ width: 44, height: 44, borderRadius: 999, overflow: "hidden", border: "1px solid #333", flexShrink: 0, background: "#1f1f26" }}>
++                      {avatar ? <img src={avatar} alt="avatar" width={44} height={44} style={{ width: 44, height: 44, objectFit: "cover" }} /> : null}
++                    </div>
++
++                    <div style={{ minWidth: 0 }}>
++                      <div style={{ fontWeight: 950, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
++                        {u?.displayName || u?.username || t("genericUser")}
++                      </div>
++                      <div style={{ fontSize: 12, color: "var(--tiko-text-dim)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
++                        @{u?.username || "—"} • {t("friendsWantsToAddYou")}
++                      </div>
++                    </div>
++                  </div>
++
++                  <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
++                    <button type="button" style={pillBtnOk} onClick={() => acceptRequest(r.id)}>
++                      {t("friendsAccept")}
++                    </button>
++                    <button type="button" style={pillBtnDanger} onClick={() => declineRequest(r.id)}>
++                      {t("friendsDecline")}
++                    </button>
+                   </div>
+                 </div>
+               );
+             })}
+           </div>
++
++          {/* Sent requests */}
++          <div style={sectionTitle}>{t("friendsRequestsSent")}</div>
++
++          {!busy && !err && sentReqs.length === 0 ? (
++            <div style={{ marginTop: 6, color: "var(--tiko-text-dim)" }}>{t("friendsNoRequestsSent")}</div>
++          ) : null}
++
++          <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 10 }}>
++            {sentReqs.map((r) => {
++              const u = (r as any).receiver as Friend | undefined;
++              const avatar = resolveUrl(u?.avatarUrl);
++              return (
++                <div
++                  key={r.id}
++                  style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: 12, borderRadius: 14, border: "1px solid #232323" }}
++                >
++                  <div style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0 }}>
++                    <div style={{ width: 44, height: 44, borderRadius: 999, overflow: "hidden", border: "1px solid #333", flexShrink: 0, background: "#1f1f26" }}>
++                      {avatar ? <img src={avatar} alt="avatar" width={44} height={44} style={{ width: 44, height: 44, objectFit: "cover" }} /> : null}
++                    </div>
++
++                    <div style={{ minWidth: 0 }}>
++                      <div style={{ fontWeight: 950, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
++                        {u?.displayName || u?.username || t("genericUser")}
++                      </div>
++                      <div style={{ fontSize: 12, color: "var(--tiko-text-dim)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
++                        @{u?.username || "—"}
++                      </div>
++                    </div>
++                  </div>
++
++                  <div style={{ color: "var(--tiko-text-dim)", fontWeight: 900 }}>{t("friendsPending")}</div>
++                </div>
++              );
++            })}
++          </div>
++
++          {/* Hidden: just to keep eslint happy about unused vars */}
++          <div style={{ display: "none" }}>{user ? "" : ""}</div>
+         </div>
+       </div>
+     </div>
+diff -ruN a/src/pages/HomePage.tsx b/src/pages/HomePage.tsx
+--- a/src/pages/HomePage.tsx	2025-12-27 00:18:14.000000000 +0000
++++ b/src/pages/HomePage.tsx	2025-12-27 07:19:09.638525771 +0000
+@@ -1,4 +1,5 @@
+ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
++import axios from "axios";
+ import { useLocation } from "react-router-dom";
+ import Sidebar from "../components/ui/Sidebar";
+ import ConversationList from "../components/ui/ConversationList";
+@@ -70,7 +71,69 @@
+     const uid = Number(p?.userId || p?.user?.id || 0);
+     if (uid && uid !== myId) return uid;
+   }
+-  return null;
++  
++return null;
++}
++
++const LS_UNREAD_COUNTS = "clasp_unread_counts_v1";
++const LS_UNREAD_TOTAL = "clasp_unread_total_v1";
++const LS_ACTIVE_CONV = "clasp_active_conversation_v1";
++
++function readUnreadCounts(): Record<number, number> {
++  try {
++    const raw = localStorage.getItem(LS_UNREAD_COUNTS);
++    const parsed = raw ? (JSON.parse(raw) as Record<string, any>) : {};
++    const out: Record<number, number> = {};
++    for (const [k, v] of Object.entries(parsed || {})) {
++      const cid = Number(k);
++      const n = Number(v);
++      if (!cid || !Number.isFinite(cid)) continue;
++      if (!Number.isFinite(n) || n <= 0) continue;
++      out[cid] = Math.floor(n);
++    }
++    return out;
++  } catch {
++    return {};
++  }
++}
++
++function writeUnreadCounts(counts: Record<number, number>) {
++  try {
++    const clean: Record<string, number> = {};
++    let total = 0;
++
++    for (const [k, v] of Object.entries(counts || {})) {
++      const cid = Number(k);
++      const n = Number(v);
++      if (!cid || !Number.isFinite(cid)) continue;
++      if (!Number.isFinite(n) || n <= 0) continue;
++      const nn = Math.floor(n);
++      clean[String(cid)] = nn;
++      total += nn;
++    }
++
++    localStorage.setItem(LS_UNREAD_COUNTS, JSON.stringify(clean));
++    localStorage.setItem(LS_UNREAD_TOTAL, String(total));
++  } catch {
++    // ignore
++  }
++
++  try {
++    window.dispatchEvent(new Event("clasp:badge"));
++  } catch {
++    // ignore
++  }
++}
++
++function markConversationRead(conversationId: number) {
++  const cid = Number(conversationId || 0);
++  if (!cid) return;
++
++  const counts = readUnreadCounts();
++  if (!counts[cid]) return;
++
++  delete counts[cid];
++  writeUnreadCounts(counts);
+ }
+ 
+ export default function HomePage() {
+@@ -85,6 +148,8 @@
+   const [selectedConversation, setSelectedConversation] = useState<any | null>(null);
+   const [messages, setMessages] = useState<any[]>([]);
+ 
++  const [unreadCounts, setUnreadCounts] = useState<Record<number, number>>(() => readUnreadCounts());
++
+   const [q, setQ] = useState("");
+   const [city, setCity] = useState("");
+   const [area, setArea] = useState("");
+@@ -218,6 +283,40 @@
+     };
+   }, [user?.id]);
+ 
++  // Badges: keep unread counts in sync with localStorage (RealtimeBridge)
++  useEffect(() => {
++    const refresh = () => setUnreadCounts(readUnreadCounts());
++    refresh();
++    window.addEventListener("clasp:badge", refresh as any);
++    return () => window.removeEventListener("clasp:badge", refresh as any);
++  }, []);
++
++  // Preload "sent friend requests" to avoid 409 and disable the button
++  useEffect(() => {
++    if (!user) return;
++
++    let alive = true;
++    (async () => {
++      try {
++        const sent = await (api as any).fetchFriendRequestsSent?.();
++        if (!alive) return;
++
++        const ids = new Set<number>();
++        for (const r of safeArr<any>(sent)) {
++          const rid = Number((r as any)?.receiverId || (r as any)?.receiver?.id || 0);
++          if (rid) ids.add(rid);
++        }
++        setSentRequestIds(ids);
++      } catch {
++        // ignore
++      }
++    })();
++
++    return () => {
++      alive = false;
++    };
++  }, [user?.id]);
++
+   // Mobile navigation via querystring: /?view=chats|search|hub
+   useEffect(() => {
+     if (!isMobile) return;
+@@ -311,6 +410,33 @@
+     };
+   }, [selectedConversation?.id]);
+ 
++  // Keep track of the "active" conversation for notifications (RealtimeBridge uses it)
++  useEffect(() => {
++    const cid = Number(selectedConversation?.id || 0);
++    const viewing = !!cid && (!isMobile || mobileView === "chat");
++
++    try {
++      if (viewing) localStorage.setItem(LS_ACTIVE_CONV, String(cid));
++      else localStorage.removeItem(LS_ACTIVE_CONV);
++    } catch {
++      // ignore
++    }
++
++    // When the user is actively viewing a chat, mark it as read (clear badge)
++    if (viewing && cid) {
++      markConversationRead(cid);
++      setUnreadCounts(readUnreadCounts());
++    }
++
++    return () => {
++      try {
++        localStorage.removeItem(LS_ACTIVE_CONV);
++      } catch {
++        // ignore
++      }
++    };
++  }, [selectedConversation?.id, isMobile, mobileView]);
++
+ 
+   // Aggiornamento immediato UI (mobile e desktop): quando invio un messaggio via HTTP,
+   // il backend lo salva correttamente ma senza websocket/refresh la lista non si aggiorna.
+@@ -343,6 +469,21 @@
+     [selectedConversation?.id]
+   );
+ 
++  // Realtime incoming messages (Socket.IO) are bridged by RealtimeBridge via browser events.
++  useEffect(() => {
++    const onMsg = (ev: any) => {
++      const cid = Number(ev?.detail?.conversationId || 0);
++      const msg = ev?.detail?.message;
++      if (!cid || !msg) return;
++
++      // Update UI using the same updater (dedupe by id).
++      handleMessageCreated({ ...msg, conversationId: cid });
++    };
++
++    window.addEventListener("clasp:message", onMsg as any);
++    return () => window.removeEventListener("clasp:message", onMsg as any);
++  }, [handleMessageCreated]);
++
+   async function doSearch() {
+     setSearchErr(null);
+     setSearchInfo(null);
+@@ -388,12 +529,26 @@
+   async function doSendFriendRequest(userId: number) {
+     setSearchErr(null);
+     setSearchInfo(null);
++
+     try {
+       await (api as any).sendFriendRequest?.(userId);
+       setSentRequestIds((prev) => new Set(prev).add(userId));
+       setSearchInfo(t("homeRequestSent"));
+     } catch (e: any) {
+-      setSearchErr(e?.message || t("homeSendFriendRequestError"));
++      const status = e?.response?.status;
++      if (status === 409) {
++        // Already friends or request already exists
++        setSentRequestIds((prev) => new Set(prev).add(userId));
++        setSearchInfo(t("homeRequestAlreadySent"));
++        return;
++      }
++
++      const msg =
++        (axios.isAxiosError(e) && (e.response?.data as any)?.error) ||
++        e?.message ||
++        t("homeSendFriendRequestError");
++
++      setSearchErr(String(msg));
+     }
+   }
+ 
+@@ -664,9 +819,12 @@
+             <div style={{ height: "100%", overflowY: "auto" }}>
+               <ConversationList
+                 conversations={conversations}
++                unreadCounts={unreadCounts}
+                 selectedConversationId={selectedConversation?.id ?? null}
+                 onSelect={(c) => {
+                   setSelectedConversation(c);
++                  markConversationRead(Number((c as any)?.id || 0));
++                  setUnreadCounts(readUnreadCounts());
+                   setMobileView("chat");
+                 }}
+               />
+@@ -713,8 +871,13 @@
+           <div style={{ flex: 1, minHeight: 0 }}>
+             <ConversationList
+               conversations={conversations}
++              unreadCounts={unreadCounts}
+               selectedConversationId={selectedConversation?.id ?? null}
+-              onSelect={(c) => setSelectedConversation(c)}
++              onSelect={(c) => {
++                setSelectedConversation(c);
++                markConversationRead(Number((c as any)?.id || 0));
++                setUnreadCounts(readUnreadCounts());
++              }}
+             />
+           </div>
+         </div>
+diff -ruN a/src/pages/PrivacyPage.tsx b/src/pages/PrivacyPage.tsx
+--- a/src/pages/PrivacyPage.tsx	2025-12-19 23:11:18.000000000 +0000
++++ b/src/pages/PrivacyPage.tsx	2025-12-27 07:14:07.051016277 +0000
+@@ -1,181 +1,180 @@
+-import React, { useMemo } from "react";
+-import { useNavigate } from "react-router-dom";
+-import { useI18n } from "../LanguageContext";
+-
+-export default function PrivacyPage() {
+-  const nav = useNavigate();
+-  const { lang } = useI18n();
+-
+-  const content = useMemo(() => {
+-    const it = {
+-      title: "Informativa Privacy",
+-      updated: "Ultimo aggiornamento: 19 dicembre 2025",
+-      sections: [
+-        {
+-          h: "1) Dati trattati",
+-          p: [
+-            "Dati account: email, username, password (in forma cifrata/hash).",
+-            "Dati profilo: nome visualizzato, stato, mood, città/zona, immagine profilo, testi di status.",
+-            "Contenuti: messaggi e media inviati (immagini/file) necessari a fornire il servizio.",
+-            "Dati tecnici: log di sicurezza, indirizzo IP, informazioni minime di funzionamento e prevenzione abusi.",
+-          ],
+-        },
+-        {
+-          h: "2) Finalità",
+-          p: [
+-            "Erogare il servizio di chat, amicizie e funzionalità social.",
+-            "Sicurezza, prevenzione abusi/spam, miglioramento dell’esperienza utente.",
+-            "Adempimenti legali e gestione di richieste/assistenza.",
+-          ],
+-        },
+-        {
+-          h: "3) Base giuridica",
+-          p: [
+-            "Esecuzione del servizio richiesto (contratto/fornitura del servizio).",
+-            "Legittimo interesse alla sicurezza e prevenzione abusi.",
+-            "Obblighi di legge quando applicabili.",
+-          ],
+-        },
+-        {
+-          h: "4) Conservazione",
+-          p: [
+-            "I dati sono conservati per il tempo necessario a fornire il servizio e per obblighi legali o tutela di sicurezza.",
+-            "Puoi richiedere la cancellazione dell’account secondo le modalità disponibili nell’app/sito.",
+-          ],
+-        },
+-        {
+-          h: "5) Condivisione",
+-          p: [
+-            "I dati possono essere trattati da fornitori tecnici (hosting, database, storage) esclusivamente per fornire il servizio.",
+-            "Non vendiamo i tuoi dati personali.",
+-          ],
+-        },
+-        {
+-          h: "6) Sicurezza",
+-          p: [
+-            "Adottiamo misure tecniche e organizzative ragionevoli per proteggere dati e account (es. password cifrate/hash, controlli accessi).",
+-            "Nessun sistema è infallibile: ti invitiamo a usare password robuste e non condividerle.",
+-          ],
+-        },
+-        {
+-          h: "7) Diritti",
+-          p: [
+-            "Puoi richiedere accesso, rettifica, cancellazione, limitazione e portabilità nei limiti previsti dalla legge.",
+-            "Per richieste privacy usa i contatti presenti nell’app/sito.",
+-          ],
+-        },
+-        {
+-          h: "8) Minori",
+-          p: ["Il servizio non è destinato a minori secondo le normative applicabili. Se ritieni che un minore stia usando il servizio, contattaci."],
+-        },
+-        {
+-          h: "9) Modifiche",
+-          p: ["Possiamo aggiornare questa informativa. Le modifiche rilevanti saranno comunicate tramite app/sito quando appropriato."],
+-        },
+-      ],
+-    };
+-
+-    const en = {
+-      title: "Privacy Policy",
+-      updated: "Last updated: December 19, 2025",
+-      sections: [
+-        {
+-          h: "1) Data we process",
+-          p: [
+-            "Account data: email, username, password (stored as hashed/encrypted).",
+-            "Profile data: display name, status, mood, city/area, profile picture, status text.",
+-            "Content: messages and media you send (images/files) required to provide the service.",
+-            "Technical data: security logs, IP address, minimal operational data to prevent abuse.",
+-          ],
+-        },
+-        {
+-          h: "2) Purposes",
+-          p: [
+-            "Provide the chat, friends and social features.",
+-            "Security, anti-abuse/spam prevention and improving user experience.",
+-            "Legal compliance and support handling.",
+-          ],
+-        },
+-        {
+-          h: "3) Legal basis",
+-          p: [
+-            "Performance of the requested service.",
+-            "Legitimate interest in security and abuse prevention.",
+-            "Legal obligations when applicable.",
+-          ],
+-        },
+-        {
+-          h: "4) Retention",
+-          p: [
+-            "Data is retained as long as needed to provide the service and for legal/security requirements.",
+-            "You can request account deletion according to the options available in the app/website.",
+-          ],
+-        },
+-        {
+-          h: "5) Sharing",
+-          p: [
+-            "Data may be processed by technical providers (hosting, database, storage) only to deliver the service.",
+-            "We do not sell your personal data.",
+-          ],
+-        },
+-        {
+-          h: "6) Security",
+-          p: [
+-            "We use reasonable technical and organizational measures to protect data and accounts (e.g., hashed passwords, access controls).",
+-            "No system is perfect: use strong passwords and never share them.",
+-          ],
+-        },
+-        {
+-          h: "7) Your rights",
+-          p: [
+-            "You may request access, rectification, deletion, restriction and portability as provided by law.",
+-            "For privacy requests, use the contact details in the app/website.",
+-          ],
+-        },
+-        { h: "8) Children", p: ["The service is not intended for children under applicable laws. If you believe a child is using the service, contact us."] },
+-        { h: "9) Changes", p: ["We may update this policy. Material changes will be communicated through the app/website when appropriate."] },
+-      ],
+-    };
+-
+-    return lang === "en" ? en : it;
+-  }, [lang]);
+-
+-  return (
+-    <div style={{ position: "fixed", inset: 0, background: "var(--tiko-bg-dark)", overflowY: "auto", zIndex: 9999 }}>
+-      <div style={{ padding: 14, maxWidth: 900, margin: "0 auto" }}>
+-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 }}>
+-          <button
+-            type="button"
+-            onClick={() => nav(-1)}
+-            style={{
+-              padding: "8px 10px",
+-              borderRadius: 12,
+-              border: "1px solid #2a2a2a",
+-              background: "transparent",
+-              cursor: "pointer",
+-              fontWeight: 950,
+-            }}
+-          >
+-            ←
+-          </button>
+-          <div style={{ fontWeight: 950, color: "var(--tiko-text-dim)", fontSize: 12 }}>{content.updated}</div>
+-        </div>
+-
+-        <div style={{ background: "var(--tiko-bg-card)", border: "1px solid #222", borderRadius: 14, padding: 14 }}>
+-          <h2 style={{ marginTop: 0 }}>{content.title}</h2>
+-
+-          {content.sections.map((s) => (
+-            <div key={s.h} style={{ marginBottom: 14 }}>
+-              <h3 style={{ margin: "10px 0 6px" }}>{s.h}</h3>
+-              {s.p.map((p, idx) => (
+-                <p key={idx} style={{ margin: "6px 0", color: "var(--tiko-text-dim)", lineHeight: 1.5 }}>
+-                  {p}
+-                </p>
+-              ))}
+-            </div>
+-          ))}
+-        </div>
+-      </div>
+-    </div>
+-  );
+-}
++import React, { useMemo } from "react";
++import { useNavigate } from "react-router-dom";
++import { useI18n } from "../LanguageContext";
++
++export default function PrivacyPage() {
++  const nav = useNavigate();
++  const { lang } = useI18n();
++
++  const content = useMemo(() => {
++    const it = {
++      title: "Informativa Privacy",
++      updated: "Ultimo aggiornamento: 19 dicembre 2025",
++      sections: [
++        {
++          h: "1) Dati trattati",
++          p: [
++            "Dati account: email, username, password (in forma cifrata/hash).",
++            "Dati profilo: nome visualizzato, stato, mood, città/zona, immagine profilo, testi di status.",
++            "Contenuti: messaggi e media inviati (immagini/file) necessari a fornire il servizio.",
++            "Dati tecnici: log di sicurezza, indirizzo IP, informazioni minime di funzionamento e prevenzione abusi.",
++          ],
++        },
++        {
++          h: "2) Finalità",
++          p: [
++            "Erogare il servizio di chat, amicizie e funzionalità social.",
++            "Sicurezza, prevenzione abusi/spam, miglioramento dell’esperienza utente.",
++            "Adempimenti legali e gestione di richieste/assistenza.",
++          ],
++        },
++        {
++          h: "3) Base giuridica",
++          p: [
++            "Esecuzione del servizio richiesto (contratto/fornitura del servizio).",
++            "Legittimo interesse alla sicurezza e prevenzione abusi.",
++            "Obblighi di legge quando applicabili.",
++          ],
++        },
++        {
++          h: "4) Conservazione",
++          p: [
++            "I dati sono conservati per il tempo necessario a fornire il servizio e per obblighi legali o tutela di sicurezza.",
++            "Puoi richiedere la cancellazione dell’account secondo le modalità disponibili nell’app/sito.",
++          ],
++        },
++        {
++          h: "5) Condivisione",
++          p: [
++            "I dati possono essere trattati da fornitori tecnici (hosting, database, storage) esclusivamente per fornire il servizio.",
++            "Non vendiamo i tuoi dati personali.",
++          ],
++        },
++        {
++          h: "6) Sicurezza",
++          p: [
++            "Adottiamo misure tecniche e organizzative ragionevoli per proteggere dati e account (es. password cifrate/hash, controlli accessi).",
++            "Nessun sistema è infallibile: ti invitiamo a usare password robuste e non condividerle.",
++          ],
++        },
++        {
++          h: "7) Diritti",
++          p: [
++            "Puoi richiedere accesso, rettifica, cancellazione, limitazione e portabilità nei limiti previsti dalla legge.",
++            "Per richieste privacy usa i contatti presenti nell’app/sito.",
++          ],
++        },
++        {
++          h: "8) Minori",
++          p: ["Il servizio non è destinato a minori secondo le normative applicabili. Se ritieni che un minore stia usando il servizio, contattaci."],
++        },
++        {
++          h: "9) Modifiche",
++          p: ["Possiamo aggiornare questa informativa. Le modifiche rilevanti saranno comunicate tramite app/sito quando appropriato."],
++        },
++      ],
++    };
++
++    const en = {
++      title: "Privacy Policy",
++      updated: "Last updated: December 19, 2025",
++      sections: [
++        {
++          h: "1) Data we process",
++          p: [
++            "Account data: email, username, password (stored as hashed/encrypted).",
++            "Profile data: display name, status, mood, city/area, profile picture, status text.",
++            "Content: messages and media you send (images/files) required to provide the service.",
++            "Technical data: security logs, IP address, minimal operational data to prevent abuse.",
++          ],
++        },
++        {
++          h: "2) Purposes",
++          p: [
++            "Provide the chat, friends and social features.",
++            "Security, anti-abuse/spam prevention and improving user experience.",
++            "Legal compliance and support handling.",
++          ],
++        },
++        {
++          h: "3) Legal basis",
++          p: [
++            "Performance of the requested service.",
++            "Legitimate interest in security and abuse prevention.",
++            "Legal obligations when applicable.",
++          ],
++        },
++        {
++          h: "4) Retention",
++          p: [
++            "Data is retained as long as needed to provide the service and for legal/security requirements.",
++            "You can request account deletion according to the options available in the app/website.",
++          ],
++        },
++        {
++          h: "5) Sharing",
++          p: [
++            "Data may be processed by technical providers (hosting, database, storage) only to deliver the service.",
++            "We do not sell your personal data.",
++          ],
++        },
++        {
++          h: "6) Security",
++          p: [
++            "We use reasonable technical and organizational measures to protect data and accounts (e.g., hashed passwords, access controls).",
++            "No system is perfect: use strong passwords and never share them.",
++          ],
++        },
++        {
++          h: "7) Your rights",
++          p: [
++            "You may request access, rectification, deletion, restriction and portability as provided by law.",
++            "For privacy requests, use the contact details in the app/website.",
++          ],
++        },
++        { h: "8) Children", p: ["The service is not intended for children under applicable laws. If you believe a child is using the service, contact us."] },
++        { h: "9) Changes", p: ["We may update this policy. Material changes will be communicated through the app/website when appropriate."] },
++      ],
++    };
++
++    return lang === "en" ? en : it;
++  }, [lang]);
++
++  return (
++    <div style={{ position: "fixed", inset: 0, background: "var(--tiko-bg-dark)", overflowY: "auto", zIndex: 9999 }}>
++      <div style={{ padding: 14, maxWidth: 900, margin: "0 auto" }}>
++        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 }}>
++          <button
++            type="button"
++            onClick={() => nav(-1)}
++            style={{
++              padding: "8px 10px",
++              borderRadius: 12,
++              border: "1px solid #2a2a2a",
++              background: "transparent",
++              cursor: "pointer",
++              fontWeight: 950,
++            }}
++          >
++            ←
++          </button>
++        </div>
++
++        <div style={{ background: "var(--tiko-bg-card)", border: "1px solid #222", borderRadius: 14, padding: 14 }}>
++          <h2 style={{ marginTop: 0 }}>{content.title}</h2>
++
++          {content.sections.map((s) => (
++            <div key={s.h} style={{ marginBottom: 14 }}>
++              <h3 style={{ margin: "10px 0 6px" }}>{s.h}</h3>
++              {s.p.map((p, idx) => (
++                <p key={idx} style={{ margin: "6px 0", color: "var(--tiko-text-dim)", lineHeight: 1.5 }}>
++                  {p}
++                </p>
++              ))}
++            </div>
++          ))}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff -ruN a/src/pages/TermsPage.tsx b/src/pages/TermsPage.tsx
+--- a/src/pages/TermsPage.tsx	2025-12-19 23:09:11.000000000 +0000
++++ b/src/pages/TermsPage.tsx	2025-12-27 07:14:07.050124051 +0000
+@@ -1,176 +1,175 @@
+-import React, { useMemo } from "react";
+-import { useNavigate } from "react-router-dom";
+-import { useI18n } from "../LanguageContext";
+-
+-export default function TermsPage() {
+-  const nav = useNavigate();
+-  const { lang } = useI18n();
+-
+-  const content = useMemo(() => {
+-    const it = {
+-      title: "Termini e Condizioni d'uso",
+-      updated: "Ultimo aggiornamento: 19 dicembre 2025",
+-      sections: [
+-        {
+-          h: "1) Accettazione",
+-          p: [
+-            "Clasp è un servizio di comunicazione e social chat. Utilizzando Clasp, accetti i presenti Termini e l’Informativa Privacy.",
+-            "Se non accetti, non utilizzare l’app o il sito.",
+-          ],
+-        },
+-        {
+-          h: "2) Account e sicurezza",
+-          p: [
+-            "Sei responsabile delle credenziali e di tutte le attività svolte con il tuo account.",
+-            "Non condividere password e non usare account di terzi senza autorizzazione.",
+-          ],
+-        },
+-        {
+-          h: "3) Contenuti e comportamento",
+-          p: [
+-            "Sei responsabile dei contenuti che invii (messaggi, immagini, file, audio, ecc.).",
+-            "È vietato pubblicare contenuti illegali, minacciosi, violenti, discriminatori, diffamatori, o che violino diritti di terzi.",
+-            "È vietato spam, stalking, molestie, e tentativi di elusione delle misure di sicurezza.",
+-          ],
+-        },
+-        {
+-          h: "4) Moderazione e segnalazioni",
+-          p: [
+-            "Possiamo limitare o rimuovere contenuti o account in caso di violazioni, anche senza preavviso quando necessario.",
+-            "Puoi segnalare abusi tramite i canali di supporto indicati nell’app.",
+-          ],
+-        },
+-        {
+-          h: "5) Disponibilità del servizio",
+-          p: [
+-            "Il servizio può subire interruzioni, manutenzioni o modifiche.",
+-            "Non garantiamo disponibilità continua o assenza di errori.",
+-          ],
+-        },
+-        {
+-          h: "6) Limitazione di responsabilità",
+-          p: [
+-            "Clasp è fornito “così com’è”. Nella misura massima consentita dalla legge, non siamo responsabili per danni indiretti o perdite derivanti dall’uso del servizio.",
+-          ],
+-        },
+-        {
+-          h: "7) Chiusura account",
+-          p: [
+-            "Puoi interrompere l’uso del servizio in qualsiasi momento.",
+-            "Possiamo sospendere/chiudere account che violano i Termini o per motivi di sicurezza.",
+-          ],
+-        },
+-        {
+-          h: "8) Modifiche",
+-          p: [
+-            "Possiamo aggiornare i Termini. Le modifiche saranno comunicate tramite app/sito quando appropriato.",
+-          ],
+-        },
+-        {
+-          h: "9) Contatti",
+-          p: ["Per richieste su Termini o Privacy, usa i riferimenti presenti nell’app o sul sito."],
+-        },
+-      ],
+-    };
+-
+-    const en = {
+-      title: "Terms and Conditions",
+-      updated: "Last updated: December 19, 2025",
+-      sections: [
+-        {
+-          h: "1) Acceptance",
+-          p: [
+-            "Clasp is a communication and social chat service. By using Clasp you accept these Terms and the Privacy Policy.",
+-            "If you do not accept, do not use the app or website.",
+-          ],
+-        },
+-        {
+-          h: "2) Account and security",
+-          p: [
+-            "You are responsible for your credentials and all activity on your account.",
+-            "Do not share passwords and do not use third-party accounts without authorization.",
+-          ],
+-        },
+-        {
+-          h: "3) Content and conduct",
+-          p: [
+-            "You are responsible for content you send (messages, images, files, audio, etc.).",
+-            "Illegal, threatening, violent, discriminatory, defamatory content, or content that violates third-party rights is prohibited.",
+-            "Spam, stalking, harassment and attempts to bypass security measures are prohibited.",
+-          ],
+-        },
+-        {
+-          h: "4) Moderation and reporting",
+-          p: [
+-            "We may restrict or remove content/accounts in case of violations, including without notice when necessary.",
+-            "You can report abuse through the support channels provided in the app.",
+-          ],
+-        },
+-        {
+-          h: "5) Service availability",
+-          p: [
+-            "The service may experience interruptions, maintenance or changes.",
+-            "We do not guarantee continuous availability or error-free operation.",
+-          ],
+-        },
+-        {
+-          h: "6) Limitation of liability",
+-          p: ["Clasp is provided “as is”. To the maximum extent permitted by law, we are not liable for indirect damages or losses arising from use of the service."],
+-        },
+-        {
+-          h: "7) Account termination",
+-          p: [
+-            "You may stop using the service at any time.",
+-            "We may suspend/terminate accounts that violate these Terms or for security reasons.",
+-          ],
+-        },
+-        {
+-          h: "8) Changes",
+-          p: ["We may update these Terms. Changes will be communicated through the app/website when appropriate."],
+-        },
+-        { h: "9) Contact", p: ["For requests about Terms or Privacy, use the contact details available in the app/website."] },
+-      ],
+-    };
+-
+-    return lang === "en" ? en : it;
+-  }, [lang]);
+-
+-  return (
+-    <div style={{ position: "fixed", inset: 0, background: "var(--tiko-bg-dark)", overflowY: "auto", zIndex: 9999 }}>
+-      <div style={{ padding: 14, maxWidth: 900, margin: "0 auto" }}>
+-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 }}>
+-          <button
+-            type="button"
+-            onClick={() => nav(-1)}
+-            style={{
+-              padding: "8px 10px",
+-              borderRadius: 12,
+-              border: "1px solid #2a2a2a",
+-              background: "transparent",
+-              cursor: "pointer",
+-              fontWeight: 950,
+-            }}
+-          >
+-            ←
+-          </button>
+-          <div style={{ fontWeight: 950, color: "var(--tiko-text-dim)", fontSize: 12 }}>{content.updated}</div>
+-        </div>
+-
+-        <div style={{ background: "var(--tiko-bg-card)", border: "1px solid #222", borderRadius: 14, padding: 14 }}>
+-          <h2 style={{ marginTop: 0 }}>{content.title}</h2>
+-
+-          {content.sections.map((s) => (
+-            <div key={s.h} style={{ marginBottom: 14 }}>
+-              <h3 style={{ margin: "10px 0 6px" }}>{s.h}</h3>
+-              {s.p.map((p, idx) => (
+-                <p key={idx} style={{ margin: "6px 0", color: "var(--tiko-text-dim)", lineHeight: 1.5 }}>
+-                  {p}
+-                </p>
+-              ))}
+-            </div>
+-          ))}
+-        </div>
+-      </div>
+-    </div>
+-  );
+-}
++import React, { useMemo } from "react";
++import { useNavigate } from "react-router-dom";
++import { useI18n } from "../LanguageContext";
++
++export default function TermsPage() {
++  const nav = useNavigate();
++  const { lang } = useI18n();
++
++  const content = useMemo(() => {
++    const it = {
++      title: "Termini e Condizioni d'uso",
++      updated: "Ultimo aggiornamento: 19 dicembre 2025",
++      sections: [
++        {
++          h: "1) Accettazione",
++          p: [
++            "Clasp è un servizio di comunicazione e social chat. Utilizzando Clasp, accetti i presenti Termini e l’Informativa Privacy.",
++            "Se non accetti, non utilizzare l’app o il sito.",
++          ],
++        },
++        {
++          h: "2) Account e sicurezza",
++          p: [
++            "Sei responsabile delle credenziali e di tutte le attività svolte con il tuo account.",
++            "Non condividere password e non usare account di terzi senza autorizzazione.",
++          ],
++        },
++        {
++          h: "3) Contenuti e comportamento",
++          p: [
++            "Sei responsabile dei contenuti che invii (messaggi, immagini, file, audio, ecc.).",
++            "È vietato pubblicare contenuti illegali, minacciosi, violenti, discriminatori, diffamatori, o che violino diritti di terzi.",
++            "È vietato spam, stalking, molestie, e tentativi di elusione delle misure di sicurezza.",
++          ],
++        },
++        {
++          h: "4) Moderazione e segnalazioni",
++          p: [
++            "Possiamo limitare o rimuovere contenuti o account in caso di violazioni, anche senza preavviso quando necessario.",
++            "Puoi segnalare abusi tramite i canali di supporto indicati nell’app.",
++          ],
++        },
++        {
++          h: "5) Disponibilità del servizio",
++          p: [
++            "Il servizio può subire interruzioni, manutenzioni o modifiche.",
++            "Non garantiamo disponibilità continua o assenza di errori.",
++          ],
++        },
++        {
++          h: "6) Limitazione di responsabilità",
++          p: [
++            "Clasp è fornito “così com’è”. Nella misura massima consentita dalla legge, non siamo responsabili per danni indiretti o perdite derivanti dall’uso del servizio.",
++          ],
++        },
++        {
++          h: "7) Chiusura account",
++          p: [
++            "Puoi interrompere l’uso del servizio in qualsiasi momento.",
++            "Possiamo sospendere/chiudere account che violano i Termini o per motivi di sicurezza.",
++          ],
++        },
++        {
++          h: "8) Modifiche",
++          p: [
++            "Possiamo aggiornare i Termini. Le modifiche saranno comunicate tramite app/sito quando appropriato.",
++          ],
++        },
++        {
++          h: "9) Contatti",
++          p: ["Per richieste su Termini o Privacy, usa i riferimenti presenti nell’app o sul sito."],
++        },
++      ],
++    };
++
++    const en = {
++      title: "Terms and Conditions",
++      updated: "Last updated: December 19, 2025",
++      sections: [
++        {
++          h: "1) Acceptance",
++          p: [
++            "Clasp is a communication and social chat service. By using Clasp you accept these Terms and the Privacy Policy.",
++            "If you do not accept, do not use the app or website.",
++          ],
++        },
++        {
++          h: "2) Account and security",
++          p: [
++            "You are responsible for your credentials and all activity on your account.",
++            "Do not share passwords and do not use third-party accounts without authorization.",
++          ],
++        },
++        {
++          h: "3) Content and conduct",
++          p: [
++            "You are responsible for content you send (messages, images, files, audio, etc.).",
++            "Illegal, threatening, violent, discriminatory, defamatory content, or content that violates third-party rights is prohibited.",
++            "Spam, stalking, harassment and attempts to bypass security measures are prohibited.",
++          ],
++        },
++        {
++          h: "4) Moderation and reporting",
++          p: [
++            "We may restrict or remove content/accounts in case of violations, including without notice when necessary.",
++            "You can report abuse through the support channels provided in the app.",
++          ],
++        },
++        {
++          h: "5) Service availability",
++          p: [
++            "The service may experience interruptions, maintenance or changes.",
++            "We do not guarantee continuous availability or error-free operation.",
++          ],
++        },
++        {
++          h: "6) Limitation of liability",
++          p: ["Clasp is provided “as is”. To the maximum extent permitted by law, we are not liable for indirect damages or losses arising from use of the service."],
++        },
++        {
++          h: "7) Account termination",
++          p: [
++            "You may stop using the service at any time.",
++            "We may suspend/terminate accounts that violate these Terms or for security reasons.",
++          ],
++        },
++        {
++          h: "8) Changes",
++          p: ["We may update these Terms. Changes will be communicated through the app/website when appropriate."],
++        },
++        { h: "9) Contact", p: ["For requests about Terms or Privacy, use the contact details available in the app/website."] },
++      ],
++    };
++
++    return lang === "en" ? en : it;
++  }, [lang]);
++
++  return (
++    <div style={{ position: "fixed", inset: 0, background: "var(--tiko-bg-dark)", overflowY: "auto", zIndex: 9999 }}>
++      <div style={{ padding: 14, maxWidth: 900, margin: "0 auto" }}>
++        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, marginBottom: 12 }}>
++          <button
++            type="button"
++            onClick={() => nav(-1)}
++            style={{
++              padding: "8px 10px",
++              borderRadius: 12,
++              border: "1px solid #2a2a2a",
++              background: "transparent",
++              cursor: "pointer",
++              fontWeight: 950,
++            }}
++          >
++            ←
++          </button>
++        </div>
++
++        <div style={{ background: "var(--tiko-bg-card)", border: "1px solid #222", borderRadius: 14, padding: 14 }}>
++          <h2 style={{ marginTop: 0 }}>{content.title}</h2>
++
++          {content.sections.map((s) => (
++            <div key={s.h} style={{ marginBottom: 14 }}>
++              <h3 style={{ margin: "10px 0 6px" }}>{s.h}</h3>
++              {s.p.map((p, idx) => (
++                <p key={idx} style={{ margin: "6px 0", color: "var(--tiko-text-dim)", lineHeight: 1.5 }}>
++                  {p}
++                </p>
++              ))}
++            </div>
++          ))}
++        </div>
++      </div>
++    </div>
++  );
++}
